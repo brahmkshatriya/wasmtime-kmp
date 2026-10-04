@@ -197,7 +197,7 @@ build_apple() {
     local sdk_path="$(xcrun --sdk "$sdk" --show-sdk-path)"
     local cc="$(xcrun --sdk "$sdk" -f clang)"
     local ar="$(xcrun -f ar)"
-    local flags=(-std=c11 -O2 -fPIC -arch "$arch" -isysroot "$sdk_path" -I"$dep/include" -I"$NATIVE_DIR")
+    local flags=(-std=c11 -O2 -fPIC -D_DARWIN_C_SOURCE -arch "$arch" -isysroot "$sdk_path" -I"$dep/include" -I"$NATIVE_DIR")
     [[ "$force_pulley" == "1" ]] && flags+=(-DWASMTIME_KMP_FORCE_PULLEY)
     "$cc" "${flags[@]}" -c "$NATIVE_DIR/wasmtime_kmp.c" -o "$out/wasmtime_kmp.o"
     "$cc" "${flags[@]}" -c "$NATIVE_DIR/wasi_lite.c" -o "$out/wasi_lite.o"

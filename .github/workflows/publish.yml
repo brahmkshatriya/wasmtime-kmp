@@ -413,7 +413,7 @@ jobs:
         shell: bash
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
-          WASMTIME_WINDOWS_TOOLCHAIN_BIN: C:/msys64/mingw64/bin
+          WASMTIME_WINDOWS_TOOLCHAIN_BIN: C:/Program Files/Git/mingw64/bin
           WASMTIME_BASH: C:/Program Files/Git/bin/bash.exe
           CMAKE_GENERATOR: Ninja
         run: |
