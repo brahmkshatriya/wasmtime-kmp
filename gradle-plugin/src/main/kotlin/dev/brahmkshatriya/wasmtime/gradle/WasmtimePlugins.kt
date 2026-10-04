@@ -33,7 +33,20 @@ private val SDK_VERSION: String =
 private val GUEST_RUNTIME_COORDINATE: String
     get() = "dev.brahmkshatriya.wasmtime:guest-runtime:$SDK_VERSION"
 
-/** A reusable dependency set that consumer modules or convention plugins can share between host and extensions. */
+/**
+ * Named dependency set shared between the host runtime and one or more extensions.
+ *
+ * Define a set once in the top-level `wasmtime` block, then consume it from both `wasmtimeHost` and
+ * `wasmtimeExtension` so the host runtime and guest compile classpaths stay aligned.
+ *
+ * ```kotlin
+ * wasmtime {
+ *     extensionApi("pluginApi") {
+ *         add(project(":plugin-api"))
+ *     }
+ * }
+ * ```
+ */
 public open class WasmtimeDependencySet internal constructor(
     private val setName: String,
 ) : Named {
@@ -42,6 +55,7 @@ public open class WasmtimeDependencySet internal constructor(
 
     override fun getName(): String = setName
 
+    /** Adds any Gradle dependency notation accepted by [org.gradle.api.artifacts.dsl.DependencyHandler.add]. */
     public fun add(dependency: Any) {
         values += dependency
         subscribers.forEach { it(dependency) }
@@ -53,72 +67,130 @@ public open class WasmtimeDependencySet internal constructor(
     }
 }
 
-/** Generic Wasmtime Gradle settings shared by the host and extension plugins. */
+/**
+ * Shared `wasmtime { ... }` Gradle DSL.
+ *
+ * Use [extensionApi] to define named dependency groups that must be visible to both an extension at compile
+ * time and the host's generated runtime bundle.
+ */
 public open class WasmtimeSettings @Inject constructor(
     private val project: Project,
     objects: ObjectFactory,
 ) {
+    /** All named dependency sets registered for Wasmtime extensions in this project. */
     public val extensionApis: NamedDomainObjectContainer<WasmtimeDependencySet> =
         objects.domainObjectContainer(WasmtimeDependencySet::class.java) { name ->
             WasmtimeDependencySet(name)
         }
 
+    /** Creates or configures a reusable extension API dependency set named [name]. */
     public fun extensionApi(name: String, configure: Action<in WasmtimeDependencySet>) {
         configure.execute(extensionApis.maybeCreate(name))
     }
 }
 
-/** Dependency collector used by the typed host/extension DSLs. */
+/**
+ * Typed dependency collector exposed by [WasmtimeHostSettings.runtimeDependencies] and
+ * [WasmtimeExtensionSettings.compileOnlyDependencies].
+ */
 public class WasmtimeDependencyCollector internal constructor(
     private val project: Project,
     private val configuration: Configuration,
     private val settings: WasmtimeSettings,
 ) {
+    /** Adds a dependency directly to the underlying Wasmtime configuration. */
     public fun add(dependency: Any) {
         project.dependencies.add(configuration.name, dependency)
     }
 
+    /** Includes every dependency from [set], including dependencies added to that set later. */
     public fun from(set: WasmtimeDependencySet) {
         set.subscribe(::add)
     }
 
+    /** Includes the shared dependency set previously registered as `wasmtime.extensionApi(name)`. */
     public fun useExtensionApi(name: String) {
         from(settings.extensionApis.maybeCreate(name))
     }
 }
 
+/**
+ * `wasmtimeExtension { ... }` settings for a Kotlin/Wasm-WASI extension project.
+ *
+ * A typical contract-based extension only needs [contractInterface], [entryPointAnnotation], and any shared
+ * compile-only API dependencies:
+ *
+ * ```kotlin
+ * wasmtimeExtension {
+ *     contractInterface.set("com.example.Plugin")
+ *     entryPointAnnotation.set("com.example.ExtensionEntry")
+ *     compileOnlyDependencies { useExtensionApi("pluginApi") }
+ * }
+ * ```
+ */
 public open class WasmtimeExtensionSettings internal constructor(
     private val project: Project,
     objects: ObjectFactory,
     compileOnlyConfiguration: Configuration,
     settings: WasmtimeSettings,
 ) {
+    /** Final exported Wasm file name under `build/wasmtime/`. Defaults to `<project-name>.wasm`. */
     public val outputFileName: Property<String> = objects.property(String::class.java)
+
+    /**
+     * Fully-qualified annotation placed on exactly one top-level guest implementation object.
+     * The plugin uses it to discover the contract implementation and generate the guest adapter.
+     */
     public val entryPointAnnotation: Property<String> = objects.property(String::class.java)
+
+    /** Fully-qualified suspend contract interface implemented by the guest and proxied on the host. */
     public val contractInterface: Property<String> = objects.property(String::class.java)
+
+    /** Additional generated Kotlin source directories included in `wasmWasiMain`. */
     public val generatedSourceDirectories: ConfigurableFileCollection = objects.fileCollection()
     private val compileOnly = WasmtimeDependencyCollector(project, compileOnlyConfiguration, settings)
 
+    /**
+     * Adds libraries needed to compile the extension but supplied by the host runtime at execution time.
+     *
+     * Prefer [WasmtimeDependencyCollector.useExtensionApi] for shared contract/API dependency sets.
+     */
     public fun compileOnlyDependencies(configure: Action<in WasmtimeDependencyCollector>) {
         configure.execute(compileOnly)
     }
 
-    /** Registers generated Kotlin source and the task that produces it. */
+    /**
+     * Registers an additional generated Kotlin source directory and its producing task.
+     *
+     * This is intended for code generators used by an extension; ordinary source directories need no registration.
+     */
     public fun generatedSource(directory: Any, builtBy: Any) {
         generatedSourceDirectories.from(directory)
         generatedSourceDirectories.builtBy(builtBy)
     }
 }
 
+/**
+ * `wasmtimeHost { ... }` settings for the application/library that loads extensions.
+ *
+ * When [contractInterface] is configured, the plugin generates `<Contract>WasmtimeProxy` into `commonMain`.
+ * [runtimeDependencies] controls the Wasm/WASI KLIBs bundled into `build/wasmtime/runtime`.
+ */
 public open class WasmtimeHostSettings internal constructor(
     project: Project,
     runtimeConfiguration: Configuration,
     settings: WasmtimeSettings,
     objects: ObjectFactory,
 ) {
+    /** Fully-qualified suspend contract interface for which a host-side proxy is generated. */
     public val contractInterface: Property<String> = objects.property(String::class.java)
     private val runtime = WasmtimeDependencyCollector(project, runtimeConfiguration, settings)
 
+    /**
+     * Adds Wasm/WASI libraries that the host should build into its shared runtime bundle.
+     *
+     * Use the same shared API sets as the corresponding extension's compile-only dependencies.
+     */
     public fun runtimeDependencies(configure: Action<in WasmtimeDependencyCollector>) {
         configure.execute(runtime)
     }
@@ -168,6 +240,12 @@ private fun Project.registerTypePruner(): TypePrunerRegistration {
 }
 
 
+/**
+ * Gradle plugin `dev.brahmkshatriya.wasmtime.extension`.
+ *
+ * It configures a Kotlin/Wasm-WASI target, adds the SDK guest runtime as compile-only, generates the contract
+ * adapter, and registers `exportWasmtimeExtension`, whose output is `build/wasmtime/<outputFileName>`.
+ */
 class WasmtimeExtensionPlugin : Plugin<Project> {
     @OptIn(ExperimentalWasmDsl::class)
     override fun apply(project: Project) = with(project) {
@@ -245,6 +323,12 @@ class WasmtimeExtensionPlugin : Plugin<Project> {
     }
 }
 
+/**
+ * Gradle plugin `dev.brahmkshatriya.wasmtime.host`.
+ *
+ * It creates the typed [WasmtimeHostSettings] DSL, generates a host proxy for the configured contract, and
+ * registers `buildWasmtimeRuntime`, which produces an ordered `runtime.tsv` plus shared Wasm modules.
+ */
 class WasmtimeHostPlugin : Plugin<Project> {
     override fun apply(project: Project) = with(project) {
         val sharedSettings = wasmtimeSettings()

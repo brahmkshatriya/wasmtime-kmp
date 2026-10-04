@@ -9,19 +9,42 @@ import kotlinx.coroutines.yield
 import kotlin.time.TimeSource
 
 /**
- * Opaque transport used by generated contract proxies.
+ * Transport used by generated host-side contract proxies.
  *
- * Consumers provide capability/lifecycle policy; generated proxies provide the
- * stable method id and decode the returned bytes into the contract type.
+ * Most applications create one with [createWasmtimeExtensionTransport] and pass it to the generated
+ * `<Contract>WasmtimeProxy`. The generated proxy owns method IDs and serialization; application code only
+ * supplies Wasm bytes, runtime modules, limits, and explicit host capabilities.
+ *
+ * [invoke] is suspend because a guest contract method may suspend on guest timers or asynchronous host calls.
  */
 public fun interface WasmtimeExtensionTransport {
+    /** Invokes one generated contract method and returns its serialized result bytes. */
     public suspend fun invoke(methodId: Int): ByteArray
 }
 
 /**
- * Creates the opaque transport consumed by generated contract proxies. The SDK
- * owns method IDs, instance lifecycle, and the fixed wire protocol; callers only
- * provide the normal Wasmtime capabilities and resource policy.
+ * Creates a transport for a generated Wasmtime contract proxy.
+ *
+ * This is the recommended high-level host API for third-party extensions. The SDK owns the fixed wire ABI,
+ * method IDs, instance lifecycle, cancellation, and browser worker isolation. Callers provide only the root
+ * extension bytes, generated shared [runtime], [limits], and explicitly granted capabilities.
+ *
+ * ```kotlin
+ * val transport = createWasmtimeExtensionTransport(
+ *     wasm = extensionBytes,
+ *     runtime = runtime,
+ *     httpHandler = httpCapability,
+ *     storage = WasmtimeStorage(pluginDataDir),
+ * )
+ * val plugin = PluginWasmtimeProxy(transport)
+ * val value = plugin.load()
+ * ```
+ *
+ * On browser/WasmJS this path executes the untrusted extension in a dedicated worker so
+ * [WasmtimeLimits.maxExecutionMillis] can terminate runaway synchronous Wasm.
+ *
+ * @param maxResultBytes maximum serialized contract result/error size, or `0` to accept only empty results.
+ * @throws IllegalArgumentException when input modules or [maxResultBytes] violate the configured limits.
  */
 public fun createWasmtimeExtensionTransport(
     wasm: ByteArray,
@@ -80,7 +103,14 @@ internal expect fun createPlatformWasmtimeExtensionTransport(
 
 /**
  * Invokes one generated extension method through wasmtime-kmp's fixed async ABI.
- * Wire export names and lifecycle/status values are intentionally SDK-owned.
+ *
+ * Generated proxies call this indirectly through [WasmtimeExtensionTransport]; normal application code should
+ * not need method IDs. Cancellation of the calling coroutine is propagated to the guest operation.
+ *
+ * @param methodId deterministic method ID generated from the configured contract.
+ * @param maxResultBytes maximum returned result or error payload size.
+ * @throws IllegalArgumentException if the guest reports an invalid/oversized payload.
+ * @throws CancellationException if the guest operation is cancelled.
  */
 public suspend fun WasmtimeInstance.callExtension(
     methodId: Int,

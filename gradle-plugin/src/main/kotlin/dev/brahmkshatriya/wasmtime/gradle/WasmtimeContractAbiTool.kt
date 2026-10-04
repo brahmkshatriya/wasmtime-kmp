@@ -14,7 +14,14 @@ import org.jetbrains.kotlin.library.abi.AbiTypeNullability
 import org.jetbrains.kotlin.library.abi.AbiVariance
 import org.jetbrains.kotlin.library.abi.LibraryAbiReader
 
+/**
+ * Internal command-line entry point used by the Gradle plugin to inspect compiled contract KLIBs.
+ *
+ * This object is public only because Gradle launches it in an isolated JVM; application code should use the
+ * host/extension Gradle DSL rather than invoking it directly.
+ */
 public object WasmtimeContractAbiToolMain {
+    /** Executes the isolated ABI inspection process. Intended for the Gradle plugin only. */
     @JvmStatic
     public fun main(args: Array<String>) {
         require(args.size >= 2) { "usage: WasmtimeContractAbiToolMain <contract-fq-name> <klib>..." }

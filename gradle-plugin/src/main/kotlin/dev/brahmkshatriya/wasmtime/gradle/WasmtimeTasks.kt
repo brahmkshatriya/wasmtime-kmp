@@ -77,6 +77,12 @@ internal fun runTypePruner(pruner: File, source: File, target: File) {
     }
 }
 
+/**
+ * Builds the bundled Rust helper that removes unreachable Wasm GC type groups.
+ *
+ * This task is registered automatically by the Wasmtime Gradle plugins; consumers normally invoke
+ * `exportWasmtimeExtension` or `buildWasmtimeRuntime` instead of configuring it directly.
+ */
 abstract class BuildWasmTypePrunerTask : DefaultTask() {
     @get:Input
     abstract val rustVersion: Property<String>
@@ -135,6 +141,11 @@ abstract class BuildWasmTypePrunerTask : DefaultTask() {
     }
 }
 
+/**
+ * Produces the final stripped/pruned extension Wasm file from the compiled `wasmWasi` KLIB.
+ *
+ * Registered as `exportWasmtimeExtension` by [WasmtimeExtensionPlugin]. Its primary output is [outputWasm].
+ */
 abstract class ExportWasmtimeExtensionTask @Inject constructor(
     private val execOperations: ExecOperations,
 ) : DefaultTask() {
@@ -212,6 +223,12 @@ private data class RuntimeKlib(
     val dependencies: Set<String>,
 )
 
+/**
+ * Builds the shared open-world Wasm runtime consumed by extension instances.
+ *
+ * Registered as `buildWasmtimeRuntime` by [WasmtimeHostPlugin]. [outputDirectory] contains the ordered runtime
+ * modules and `runtime.tsv`, which can be loaded with `loadWasmtimeRuntime(...)` from the runtime library.
+ */
 abstract class BuildWasmtimeRuntimeTask @Inject constructor(
     private val execOperations: ExecOperations,
 ) : DefaultTask() {

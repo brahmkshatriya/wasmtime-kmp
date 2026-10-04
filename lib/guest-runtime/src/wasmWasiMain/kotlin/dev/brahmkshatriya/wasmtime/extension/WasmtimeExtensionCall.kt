@@ -15,10 +15,16 @@ import kotlinx.coroutines.launch
 import kotlin.coroutines.CoroutineContext
 
 /**
- * Shared guest-side state machine used by generated Wasmtime extension adapters.
+ * Guest-side coroutine state machine used by generated Wasmtime extension adapters.
  *
- * Extension modules keep only their contract adapter and implementation. The host
- * provides this module as part of the shared open-world runtime.
+ * This class is public so generated adapter code can call it, but extension authors normally do not construct it
+ * directly. The Gradle extension plugin generates the fixed ABI exports and wires contract methods into [execute].
+ * The host supplies this module once as part of the shared open-world runtime.
+ *
+ * [start] begins one operation, [poll] advances its virtual clock, [nextWakeMillis] tells the host when another
+ * poll is useful, and the result/error accessors expose the completed byte payload to the fixed ABI.
+ *
+ * @param execute generated dispatcher that serializes the result for one deterministic contract method ID.
  */
 public class WasmtimeExtensionCall(
     private val execute: suspend (methodId: Int) -> ByteArray,
@@ -32,8 +38,10 @@ public class WasmtimeExtensionCall(
     private var resultBytes: ByteArray = ByteArray(0)
     private var errorBytes: ByteArray = ByteArray(0)
 
+    /** Starts method ID `0`; retained for generated/low-level adapters that use a single entry point. */
     public fun start(): Int = start(0)
 
+    /** Starts [methodId] unless another operation is already pending, and returns the current state constant. */
     public fun start(methodId: Int): Int {
         if (state == PENDING) return PENDING
 
@@ -72,15 +80,18 @@ public class WasmtimeExtensionCall(
         return state
     }
 
+    /** Advances guest virtual time by [elapsedMillis], runs ready coroutines, and returns the current state. */
     public fun poll(elapsedMillis: Int): Int {
         if (state != PENDING) return state
         dispatcher.advance(elapsedMillis.coerceAtLeast(0))
         return state
     }
 
+    /** Returns milliseconds until the next scheduled guest wake-up, `0` if work is ready, or `-1` if none. */
     public fun nextWakeMillis(): Int =
         if (state == PENDING) dispatcher.nextWakeMillis() else 0
 
+    /** Cancels a pending guest operation and returns the resulting state. */
     public fun cancel(): Int {
         if (state == PENDING) {
             operation?.cancel(CancellationException("host cancelled plugin call"))
@@ -89,12 +100,16 @@ public class WasmtimeExtensionCall(
         return state
     }
 
+    /** Returns completed result length, or `-1` until the operation succeeds. */
     public fun resultLength(): Int = if (state == SUCCESS) resultBytes.size else -1
 
+    /** Returns one unsigned byte (`0..255`) from a successful result payload. */
     public fun resultByte(index: Int): Int = resultBytes[index].toInt() and 0xff
 
+    /** Returns the encoded error/cancellation message length, or `0` when no error payload is available. */
     public fun errorLength(): Int = if (state == FAILURE || state == CANCELLED) errorBytes.size else 0
 
+    /** Returns one unsigned byte (`0..255`) from the current error/cancellation payload. */
     public fun errorByte(index: Int): Int = errorBytes[index].toInt() and 0xff
 
     @OptIn(InternalCoroutinesApi::class)
@@ -175,10 +190,15 @@ public class WasmtimeExtensionCall(
         }
     }
 
+    /** Fixed state values consumed by the generated host/guest ABI. */
     public companion object {
+        /** The operation has suspended and requires further polling. */
         public const val PENDING: Int = 0
+        /** The operation completed and result bytes are available. */
         public const val SUCCESS: Int = 1
+        /** The operation failed and error bytes are available. */
         public const val FAILURE: Int = 2
+        /** The operation was cancelled and cancellation-message bytes are available. */
         public const val CANCELLED: Int = 3
         private const val IDLE: Int = -1
     }

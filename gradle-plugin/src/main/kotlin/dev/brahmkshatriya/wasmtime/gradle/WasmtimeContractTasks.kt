@@ -37,6 +37,12 @@ private data class ContractMethod(
 
 private data class SourceToken(val type: Any, val text: String)
 
+/**
+ * Generates the guest-side adapter that binds a configured contract interface to the annotated implementation.
+ *
+ * Registered automatically by [WasmtimeExtensionPlugin]; extension authors configure
+ * [WasmtimeExtensionSettings.contractInterface] and [WasmtimeExtensionSettings.entryPointAnnotation] instead.
+ */
 abstract class GenerateWasmtimeExtensionAdapterTask @Inject constructor(
     private val execOperations: ExecOperations,
 ) : DefaultTask() {
@@ -167,6 +173,12 @@ abstract class GenerateWasmtimeExtensionAdapterTask @Inject constructor(
     }
 }
 
+/**
+ * Generates the host-side `<Contract>WasmtimeProxy` implementation for a compiled contract KLIB.
+ *
+ * Registered automatically by [WasmtimeHostPlugin]; consumers normally configure
+ * [WasmtimeHostSettings.contractInterface] rather than this task directly.
+ */
 abstract class GenerateWasmtimeHostProxyTask @Inject constructor(
     private val execOperations: ExecOperations,
 ) : DefaultTask() {
@@ -221,6 +233,12 @@ abstract class GenerateWasmtimeHostProxyTask @Inject constructor(
             import kotlinx.serialization.decodeFromString
             import kotlinx.serialization.json.Json
 
+            /**
+             * Generated host-side implementation of [$contract].
+             *
+             * Create [transport] with `createWasmtimeExtensionTransport(...)`; this proxy handles stable method
+             * IDs and JSON serialization for the contract methods.
+             */
             public class $className(
                 private val transport: WasmtimeExtensionTransport,
                 private val json: Json = Json { ignoreUnknownKeys = true },
