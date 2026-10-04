@@ -46,6 +46,13 @@ find_linux_arm64_tool() {
         printf '%s\n' "$override"
         return
     fi
+    case "$(uname -m)" in
+        aarch64|arm64)
+            command -v "$tool" >/dev/null 2>&1 || { echo "Native ARM64 tool not found: $tool" >&2; exit 1; }
+            command -v "$tool"
+            return
+            ;;
+    esac
     local path_tool="aarch64-unknown-linux-gnu-$tool"
     if command -v "$path_tool" >/dev/null 2>&1; then
         command -v "$path_tool"
@@ -70,6 +77,32 @@ find_konan_dependency() {
     done
     echo "Kotlin/Native dependency not found: $pattern" >&2
     exit 1
+}
+
+is_windows_host() {
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+find_windows_native_tool() {
+    local tool="$1"
+    local override_var="WASMTIME_WINDOWS_${tool^^}"
+    local override="${!override_var:-}"
+    if [[ -n "$override" ]]; then
+        [[ -x "$override" ]] || { echo "$override_var is not executable: $override" >&2; exit 1; }
+        printf '%s\n' "$override"
+        return
+    fi
+    local bin="${WASMTIME_WINDOWS_TOOLCHAIN_BIN:-C:/msys64/mingw64/bin}"
+    local candidate="$bin/$tool.exe"
+    if [[ -x "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return
+    fi
+    command -v "$tool" >/dev/null 2>&1 || { echo "Windows native tool not found: $tool" >&2; exit 1; }
+    command -v "$tool"
 }
 
 
@@ -111,18 +144,26 @@ build_windows_x64() {
     headers="$(download_wasmtime x86_64-linux)"
     local archive="$DEPS/slim/x86_64-windows-gnu/lib/libwasmtime.a"
     [[ -f "$archive" ]] || { echo "Windows compact Wasmtime archive is missing; run build-slim-wasmtime.sh windows-x64" >&2; exit 1; }
-    local mingw="$(find_konan_dependency 'msys2-mingw-w64-x86_64-*')"
-    local llvm="$(find_konan_dependency 'llvm-*-x86_64-linux-essentials-*')"
-    local cc="$llvm/bin/clang"
-    local ar="$llvm/bin/llvm-ar"
     local out="$ROOT/lib/build/native/mingwX64"
     mkdir -p "$out"
-    local flags=(
-        --target=x86_64-w64-windows-gnu --sysroot="$mingw"
-        -isystem "$mingw/x86_64-w64-mingw32/include"
-        -std=c11 -O2 -D_WIN32_WINNT=0x0601
-        -I"$headers/include" -I"$NATIVE_DIR"
-    )
+
+    local cc ar
+    local flags=(-std=c11 -O2 -D_WIN32_WINNT=0x0601 -I"$headers/include" -I"$NATIVE_DIR")
+    if is_windows_host; then
+        cc="$(find_windows_native_tool gcc)"
+        ar="$(find_windows_native_tool ar)"
+    else
+        local mingw="$(find_konan_dependency 'msys2-mingw-w64-x86_64-*')"
+        local llvm="$(find_konan_dependency 'llvm-*-x86_64-linux-essentials-*')"
+        cc="$llvm/bin/clang"
+        ar="$llvm/bin/llvm-ar"
+        flags=(
+            --target=x86_64-w64-windows-gnu --sysroot="$mingw"
+            -isystem "$mingw/x86_64-w64-mingw32/include"
+            "${flags[@]}"
+        )
+    fi
+
     "$cc" "${flags[@]}" -c "$NATIVE_DIR/wasmtime_kmp.c" -o "$out/wasmtime_kmp.o"
     "$cc" "${flags[@]}" -c "$NATIVE_DIR/wasi_lite.c" -o "$out/wasi_lite.o"
     "$cc" "${flags[@]}" -c "$NATIVE_DIR/windows_compat.c" -o "$out/windows_compat.o"
@@ -263,9 +304,15 @@ case "${1:-}" in
     ios-arm64)
         build_ios_arm64
         ;;
-    android-all)
+    android-arm64)
         build_android_abi aarch64-android arm64-v8a aarch64-linux-android24-clang
+        ;;
+    android-x86_64)
         build_android_abi x86_64-android x86_64 x86_64-linux-android24-clang
+        ;;
+    android-all)
+        "$0" android-arm64
+        "$0" android-x86_64
         ;;
     jvm-linux-x64)
         build_jvm_linux_x64
@@ -278,7 +325,7 @@ case "${1:-}" in
         build_jvm_linux_arm64
         ;;
     *)
-        echo "usage: $0 {linux-x64|linux-arm64|windows-x64|macos-x64|macos-arm64|ios-arm64|android-all|jvm-linux-x64|jvm-linux-arm64|jvm-linux-all}" >&2
+        echo "usage: $0 {linux-x64|linux-arm64|windows-x64|macos-x64|macos-arm64|ios-arm64|android-arm64|android-x86_64|android-all|jvm-linux-x64|jvm-linux-arm64|jvm-linux-all}" >&2
         exit 2
         ;;
 esac

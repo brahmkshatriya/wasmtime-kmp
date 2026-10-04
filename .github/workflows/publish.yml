@@ -49,6 +49,10 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  WASMTIME_VERSION: "49.0.1"
+  WASMTIME_RUST_VERSION: "1.96.0"
+
 jobs:
   prepare:
     name: Resolve publication version
@@ -66,7 +70,6 @@ jobs:
         run: |
           set -euo pipefail
           publish=false
-
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
             if [[ "$MANUAL_PUBLISH" == "true" ]]; then
               publish=true
@@ -82,7 +85,6 @@ jobs:
           else
             version="0.1.0-ci.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
           fi
-
           if [[ ! "$version" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
             echo "Invalid Maven version: $version" >&2
             exit 1
@@ -91,159 +93,422 @@ jobs:
             echo "SNAPSHOT versions are not allowed in isolated publication repositories" >&2
             exit 1
           fi
-
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
-          echo "Publication version: $version"
-          echo "Publish to Central: $publish"
 
-  linux:
-    name: Build Linux/Android/JVM/Web/Windows repository
+  common:
+    name: Build common/JVM/Web/WASI/plugin repository
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Publish architecture-neutral artifacts
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          repository="$GITHUB_WORKSPACE/release/common-repository"
+          rm -rf "$repository"
+          export WASMTIME_MAVEN_REPOSITORY="$repository"
+          ./gradlew --no-daemon --stacktrace --no-configuration-cache \
+            "-PVERSION=$RELEASE_VERSION" \
+            publishWasmtimeCommonToMavenRepository
+          test -s "$repository/dev/brahmkshatriya/wasmtime/lib/$RELEASE_VERSION/lib-$RELEASE_VERSION.module"
+          test -s "$repository/dev/brahmkshatriya/wasmtime/lib-jvm/$RELEASE_VERSION/lib-jvm-$RELEASE_VERSION.jar"
+          test -s "$repository/dev/brahmkshatriya/wasmtime/lib-wasm-js/$RELEASE_VERSION/lib-wasm-js-$RELEASE_VERSION.klib"
+          test -s "$repository/dev/brahmkshatriya/wasmtime/guest-runtime-wasm-wasi/$RELEASE_VERSION/guest-runtime-wasm-wasi-$RELEASE_VERSION.klib"
+          test -s "$repository/dev/brahmkshatriya/wasmtime/wasmtime-kmp-gradle-plugin/$RELEASE_VERSION/wasmtime-kmp-gradle-plugin-$RELEASE_VERSION.jar"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasmtime-kmp-repo-common-${{ needs.prepare.outputs.version }}
+          path: release/common-repository
+          if-no-files-found: error
+          retention-days: 7
+
+  android_arm64:
+    name: Build Android ARM64 native payload
     needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
-      - name: Check out code
-        uses: actions/checkout@v7.0.1
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@v6.0.1
-        with:
-          distribution: temurin
-          java-version: 21
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v6
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
-
-      - name: Install Android platform and NDK
+      - uses: actions/checkout@v7.0.1
+      - uses: android-actions/setup-android@v4
+      - name: Install Android NDK r29
         shell: bash
-        run: |
-          set -euo pipefail
-          sdkmanager "platforms;android-37" "ndk;29.0.14206865"
-
-      - name: Cache slim Wasmtime toolchains and archives
-        uses: actions/cache@v4
+        run: sdkmanager "ndk;29.0.14206865"
+      - uses: actions/cache@v4
         with:
           path: |
             lib/src/native/.deps/cargo
             lib/src/native/.deps/rustup
-            lib/src/native/.deps/slim
-            lib/src/native/.deps/slim-target
-          key: wasmtime-slim-${{ runner.os }}-${{ runner.arch }}-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
-
-      - name: Build isolated non-Apple Maven repository
+            lib/src/native/.deps/slim/aarch64-android
+            lib/src/native/.deps/slim-target/aarch64-android
+          key: wasmtime-android-arm64-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
+      - name: Build Android ARM64 payload
         shell: bash
         env:
-          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
-          WASMTIME_KMP_VERSION: ${{ needs.prepare.outputs.version }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/29.0.14206865
         run: |
           set -euo pipefail
-          repository="$GITHUB_WORKSPACE/release/linux-repository"
-          rm -rf "$repository"
-          export WASMTIME_MAVEN_REPOSITORY="$repository"
-          ./gradlew \
-            --no-daemon \
-            --stacktrace \
-            --no-configuration-cache \
-            "-PVERSION=$RELEASE_VERSION" \
-            publishWasmtimeNonAppleToMavenRepository
-
-      - name: Verify non-Apple Maven repository
-        shell: bash
-        env:
-          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          set -euo pipefail
-          python3 scripts/verify-wasmtime-repository.py \
-            release/linux-repository "$RELEASE_VERSION" --allow-missing-apple
-          bash scripts/verify-wasmtime-consumer.sh \
-            release/linux-repository "$RELEASE_VERSION"
-          du -sh release/linux-repository
-
-      - name: Upload non-Apple Maven repository
-        uses: actions/upload-artifact@v4
+          bash lib/src/native/build-slim-wasmtime.sh android-arm64
+          bash lib/src/native/build.sh android-arm64
+          test -s lib/build/generated/jniLibs/arm64-v8a/libwasmtime_kmp.so
+      - uses: actions/upload-artifact@v4
         with:
-          name: wasmtime-kmp-repo-linux-${{ needs.prepare.outputs.version }}
-          path: release/linux-repository
+          name: wasmtime-kmp-android-arm64-${{ needs.prepare.outputs.version }}
+          path: lib/build/generated/jniLibs/arm64-v8a
           if-no-files-found: error
           retention-days: 7
 
-  apple:
-    name: Build macOS/iOS repository
+  android_x64:
+    name: Build Android x86_64 native payload
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: android-actions/setup-android@v4
+      - name: Install Android NDK r29
+        shell: bash
+        run: sdkmanager "ndk;29.0.14206865"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            lib/src/native/.deps/cargo
+            lib/src/native/.deps/rustup
+            lib/src/native/.deps/slim/x86_64-android
+            lib/src/native/.deps/slim-target/x86_64-android
+          key: wasmtime-android-x64-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
+      - name: Build Android x86_64 payload
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/29.0.14206865
+        run: |
+          set -euo pipefail
+          bash lib/src/native/build-slim-wasmtime.sh android-x86_64
+          bash lib/src/native/build.sh android-x86_64
+          test -s lib/build/generated/jniLibs/x86_64/libwasmtime_kmp.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasmtime-kmp-android-x64-${{ needs.prepare.outputs.version }}
+          path: lib/build/generated/jniLibs/x86_64
+          if-no-files-found: error
+          retention-days: 7
+
+  android:
+    name: Package Android x86_64 + ARM64 AAR
+    needs:
+      - prepare
+      - android_arm64
+      - android_x64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v6
+      - uses: android-actions/setup-android@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasmtime-kmp-android-arm64-${{ needs.prepare.outputs.version }}
+          path: lib/build/generated/jniLibs/arm64-v8a
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasmtime-kmp-android-x64-${{ needs.prepare.outputs.version }}
+          path: lib/build/generated/jniLibs/x86_64
+      - name: Publish Android AAR from prebuilt ABI payloads
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -s lib/build/generated/jniLibs/arm64-v8a/libwasmtime_kmp.so
+          test -s lib/build/generated/jniLibs/x86_64/libwasmtime_kmp.so
+          repository="$GITHUB_WORKSPACE/release/android-repository"
+          rm -rf "$repository"
+          export WASMTIME_MAVEN_REPOSITORY="$repository"
+          ./gradlew --no-daemon --stacktrace --no-configuration-cache \
+            "-PVERSION=$RELEASE_VERSION" \
+            -PwasmtimeAndroidPrebuilt=true \
+            publishWasmtimeAndroidToMavenRepository
+          aar="$repository/dev/brahmkshatriya/wasmtime/lib-android/$RELEASE_VERSION/lib-android-$RELEASE_VERSION.aar"
+          test -s "$aar"
+          python3 - "$aar" <<'PY'
+          import sys, zipfile
+          with zipfile.ZipFile(sys.argv[1]) as z:
+              names=set(z.namelist())
+          required={"jni/x86_64/libwasmtime_kmp.so","jni/arm64-v8a/libwasmtime_kmp.so"}
+          missing=required-names
+          if missing: raise SystemExit(f"missing Android JNI payloads: {sorted(missing)}")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasmtime-kmp-repo-android-${{ needs.prepare.outputs.version }}
+          path: release/android-repository
+          if-no-files-found: error
+          retention-days: 7
+
+  linux_x64:
+    name: Build Linux x64 repository
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v6
+      - uses: actions/cache@v4
+        with:
+          path: |
+            lib/src/native/.deps/cargo
+            lib/src/native/.deps/rustup
+            lib/src/native/.deps/slim/x86_64-linux
+            lib/src/native/.deps/slim-target/x86_64-linux
+          key: wasmtime-linux-x64-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
+      - name: Publish Linux x64 artifact and JVM classifier
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          repository="$GITHUB_WORKSPACE/release/linux-x64-repository"
+          rm -rf "$repository"
+          export WASMTIME_MAVEN_REPOSITORY="$repository"
+          ./gradlew --no-daemon --stacktrace --no-configuration-cache \
+            "-PVERSION=$RELEASE_VERSION" \
+            publishWasmtimeLinuxX64ToMavenRepository
+          test -s "$repository/dev/brahmkshatriya/wasmtime/lib-linuxx64/$RELEASE_VERSION/lib-linuxx64-$RELEASE_VERSION.klib"
+          classifier="$repository/dev/brahmkshatriya/wasmtime/lib-jvm/$RELEASE_VERSION/lib-jvm-$RELEASE_VERSION-linux-x64.jar"
+          test -s "$classifier"
+          unzip -l "$classifier" | grep -F 'native/linux-x64/libwasmtime_kmp.so'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasmtime-kmp-repo-linux-x64-${{ needs.prepare.outputs.version }}
+          path: release/linux-x64-repository
+          if-no-files-found: error
+          retention-days: 7
+
+  linux_arm64:
+    name: Build Linux ARM64 repository
+    needs: prepare
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v6
+      - uses: actions/cache@v4
+        with:
+          path: |
+            lib/src/native/.deps/cargo
+            lib/src/native/.deps/rustup
+            lib/src/native/.deps/slim/aarch64-linux
+            lib/src/native/.deps/slim-target/aarch64-linux
+          key: wasmtime-linux-arm64-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
+      - name: Publish Linux ARM64 artifact and JVM classifier
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          repository="$GITHUB_WORKSPACE/release/linux-arm64-repository"
+          rm -rf "$repository"
+          export WASMTIME_MAVEN_REPOSITORY="$repository"
+          ./gradlew --no-daemon --stacktrace --no-configuration-cache \
+            "-PVERSION=$RELEASE_VERSION" \
+            publishWasmtimeLinuxArm64ToMavenRepository
+          test -s "$repository/dev/brahmkshatriya/wasmtime/lib-linuxarm64/$RELEASE_VERSION/lib-linuxarm64-$RELEASE_VERSION.klib"
+          classifier="$repository/dev/brahmkshatriya/wasmtime/lib-jvm/$RELEASE_VERSION/lib-jvm-$RELEASE_VERSION-linux-arm64.jar"
+          test -s "$classifier"
+          unzip -l "$classifier" | grep -F 'native/linux-arm64/libwasmtime_kmp.so'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasmtime-kmp-repo-linux-arm64-${{ needs.prepare.outputs.version }}
+          path: release/linux-arm64-repository
+          if-no-files-found: error
+          retention-days: 7
+
+  windows_x64:
+    name: Build Windows x64 repository
+    needs: prepare
+    runs-on: windows-2025
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v6
+      - uses: actions/cache@v4
+        with:
+          path: |
+            lib/src/native/.deps/cargo
+            lib/src/native/.deps/rustup
+            lib/src/native/.deps/slim/x86_64-windows-gnu
+            lib/src/native/.deps/slim-target/x86_64-windows-gnu
+          key: wasmtime-windows-x64-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
+      - name: Publish Windows x64 artifact natively
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          WASMTIME_WINDOWS_TOOLCHAIN_BIN: C:/msys64/mingw64/bin
+          CMAKE_GENERATOR: Ninja
+        run: |
+          set -euo pipefail
+          case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) ;; *) echo "not running on Windows" >&2; exit 1;; esac
+          repository_posix="$PWD/release/windows-x64-repository"
+          repository_windows="$(cygpath -w "$repository_posix")"
+          rm -rf "$repository_posix"
+          export WASMTIME_MAVEN_REPOSITORY="$repository_windows"
+          ./gradlew --no-daemon --stacktrace --no-configuration-cache \
+            "-PVERSION=$RELEASE_VERSION" \
+            publishWasmtimeWindowsX64ToMavenRepository
+          test -s "$repository_posix/dev/brahmkshatriya/wasmtime/lib-mingwx64/$RELEASE_VERSION/lib-mingwx64-$RELEASE_VERSION.klib"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasmtime-kmp-repo-windows-x64-${{ needs.prepare.outputs.version }}
+          path: release/windows-x64-repository
+          if-no-files-found: error
+          retention-days: 7
+
+  macos_x64:
+    name: Build macOS x64 repository
+    needs: prepare
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v6
+      - uses: actions/cache@v4
+        with:
+          path: |
+            lib/src/native/.deps/cargo
+            lib/src/native/.deps/rustup
+            lib/src/native/.deps/slim/x86_64-macos
+            lib/src/native/.deps/slim-target/x86_64-macos
+          key: wasmtime-macos-x64-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
+      - name: Publish macOS x64 artifact
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "x86_64"
+          repository="$GITHUB_WORKSPACE/release/macos-x64-repository"
+          rm -rf "$repository"
+          export WASMTIME_MAVEN_REPOSITORY="$repository"
+          ./gradlew --no-daemon --stacktrace --no-configuration-cache \
+            "-PVERSION=$RELEASE_VERSION" \
+            publishWasmtimeMacosX64ToMavenRepository
+          test -s "$repository/dev/brahmkshatriya/wasmtime/lib-macosx64/$RELEASE_VERSION/lib-macosx64-$RELEASE_VERSION.klib"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasmtime-kmp-repo-macos-x64-${{ needs.prepare.outputs.version }}
+          path: release/macos-x64-repository
+          if-no-files-found: error
+          retention-days: 7
+
+  macos_arm64:
+    name: Build macOS ARM64 repository
     needs: prepare
     runs-on: macos-15
     timeout-minutes: 120
     steps:
-      - name: Check out code
-        uses: actions/checkout@v7.0.1
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@v6.0.1
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-java@v6.0.1
         with:
           distribution: temurin
           java-version: 21
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v6
-
-      - name: Cache slim Wasmtime toolchains and archives
-        uses: actions/cache@v4
+      - uses: gradle/actions/setup-gradle@v6
+      - uses: actions/cache@v4
         with:
           path: |
             lib/src/native/.deps/cargo
             lib/src/native/.deps/rustup
-            lib/src/native/.deps/slim
-            lib/src/native/.deps/slim-target
-          key: wasmtime-slim-${{ runner.os }}-${{ runner.arch }}-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
-
-      - name: Build isolated Apple Maven repository
+            lib/src/native/.deps/slim/aarch64-macos
+            lib/src/native/.deps/slim-target/aarch64-macos
+          key: wasmtime-macos-arm64-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
+      - name: Publish macOS ARM64 artifact
         shell: bash
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          repository="$GITHUB_WORKSPACE/release/apple-repository"
+          test "$(uname -m)" = "arm64"
+          repository="$GITHUB_WORKSPACE/release/macos-arm64-repository"
           rm -rf "$repository"
           export WASMTIME_MAVEN_REPOSITORY="$repository"
-          ./gradlew \
-            --no-daemon \
-            --stacktrace \
-            --no-configuration-cache \
+          ./gradlew --no-daemon --stacktrace --no-configuration-cache \
             "-PVERSION=$RELEASE_VERSION" \
-            publishWasmtimeAppleToMavenRepository
+            publishWasmtimeMacosArm64ToMavenRepository
+          test -s "$repository/dev/brahmkshatriya/wasmtime/lib-macosarm64/$RELEASE_VERSION/lib-macosarm64-$RELEASE_VERSION.klib"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasmtime-kmp-repo-macos-arm64-${{ needs.prepare.outputs.version }}
+          path: release/macos-arm64-repository
+          if-no-files-found: error
+          retention-days: 7
 
-      - name: Verify Apple target set
+  ios_arm64:
+    name: Build iOS ARM64 repository
+    needs: prepare
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v6
+      - uses: actions/cache@v4
+        with:
+          path: |
+            lib/src/native/.deps/cargo
+            lib/src/native/.deps/rustup
+            lib/src/native/.deps/slim/aarch64-ios
+            lib/src/native/.deps/slim-target/aarch64-ios
+          key: wasmtime-ios-arm64-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
+      - name: Publish iOS ARM64 artifact
         shell: bash
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          base="release/apple-repository/dev/brahmkshatriya/wasmtime"
-          expected=(lib-iosarm64 lib-macosarm64 lib-macosx64)
-          for artifact_dir in "$base"/*; do
-            [[ -d "$artifact_dir" ]] || continue
-            basename "$artifact_dir"
-          done | sort > "$RUNNER_TEMP/actual.txt"
-          printf '%s\n' "${expected[@]}" | sort > "$RUNNER_TEMP/expected.txt"
-          diff -u "$RUNNER_TEMP/expected.txt" "$RUNNER_TEMP/actual.txt"
-          for artifact in "${expected[@]}"; do
-            version_dir="$base/$artifact/$RELEASE_VERSION"
-            test -s "$version_dir/$artifact-$RELEASE_VERSION.klib"
-            test -s "$version_dir/$artifact-$RELEASE_VERSION.pom"
-            test -s "$version_dir/$artifact-$RELEASE_VERSION.module"
-            test -s "$version_dir/$artifact-$RELEASE_VERSION-sources.jar"
-            test -s "$version_dir/$artifact-$RELEASE_VERSION-javadoc.jar"
-          done
-          du -sh release/apple-repository
-
-      - name: Upload Apple Maven repository
-        uses: actions/upload-artifact@v4
+          test "$(uname -m)" = "arm64"
+          repository="$GITHUB_WORKSPACE/release/ios-arm64-repository"
+          rm -rf "$repository"
+          export WASMTIME_MAVEN_REPOSITORY="$repository"
+          ./gradlew --no-daemon --stacktrace --no-configuration-cache \
+            "-PVERSION=$RELEASE_VERSION" \
+            publishWasmtimeIosArm64ToMavenRepository
+          test -s "$repository/dev/brahmkshatriya/wasmtime/lib-iosarm64/$RELEASE_VERSION/lib-iosarm64-$RELEASE_VERSION.klib"
+      - uses: actions/upload-artifact@v4
         with:
-          name: wasmtime-kmp-repo-apple-${{ needs.prepare.outputs.version }}
-          path: release/apple-repository
+          name: wasmtime-kmp-repo-ios-arm64-${{ needs.prepare.outputs.version }}
+          path: release/ios-arm64-repository
           if-no-files-found: error
           retention-days: 7
 
@@ -251,50 +516,42 @@ jobs:
     name: Merge and verify complete Maven repository
     needs:
       - prepare
-      - linux
-      - apple
+      - common
+      - android
+      - linux_x64
+      - linux_arm64
+      - windows_x64
+      - macos_x64
+      - macos_arm64
+      - ios_arm64
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - name: Check out code
-        uses: actions/checkout@v7.0.1
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@v6.0.1
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-java@v6.0.1
         with:
           distribution: temurin
           java-version: 21
-
-      - name: Download non-Apple repository
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          name: wasmtime-kmp-repo-linux-${{ needs.prepare.outputs.version }}
-          path: release/shards/linux
-
-      - name: Download Apple repository
-        uses: actions/download-artifact@v4
-        with:
-          name: wasmtime-kmp-repo-apple-${{ needs.prepare.outputs.version }}
-          path: release/shards/apple
-
+          pattern: wasmtime-kmp-repo-*-${{ needs.prepare.outputs.version }}
+          path: release/shards
       - name: Merge and verify repository
         shell: bash
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
+          mapfile -t shards < <(find release/shards -mindepth 1 -maxdepth 1 -type d -print | sort)
+          test "${#shards[@]}" -eq 8
           python3 scripts/merge-wasmtime-repositories.py \
-            release/maven-repository \
-            release/shards/linux \
-            release/shards/apple
+            release/maven-repository "${shards[@]}"
           python3 scripts/verify-wasmtime-repository.py \
             release/maven-repository "$RELEASE_VERSION"
           bash scripts/verify-wasmtime-consumer.sh \
             release/maven-repository "$RELEASE_VERSION"
           du -sh release/maven-repository
-
-      - name: Upload complete Maven repository
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: wasmtime-kmp-maven-repo-${{ needs.prepare.outputs.version }}
           path: release/maven-repository
@@ -310,15 +567,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     steps:
-      - name: Check out code
-        uses: actions/checkout@v7.0.1
-
-      - name: Download complete Maven repository
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v4
         with:
           name: wasmtime-kmp-maven-repo-${{ needs.prepare.outputs.version }}
           path: release/maven-repository
-
       - name: Restore Gradle properties and signing key
         shell: bash
         env:
@@ -339,7 +592,6 @@ jobs:
           mv "$properties_file.tmp" "$properties_file"
           printf '\nsigning.secretKeyRingFile=%s\n' "$keyring" >> "$properties_file"
           chmod 600 "$properties_file" "$keyring"
-
       - name: Sign and publish one Central deployment
         shell: bash
         env:
@@ -350,7 +602,6 @@ jobs:
             "$GITHUB_WORKSPACE/release/maven-repository" \
             "$RELEASE_VERSION" \
             "$GITHUB_WORKSPACE/release/wasmtime-kmp-$RELEASE_VERSION.zip"
-
       - name: Preserve failed Central bundle
         if: failure()
         uses: actions/upload-artifact@v4

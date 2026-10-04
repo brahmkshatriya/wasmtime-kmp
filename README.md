@@ -440,7 +440,7 @@ Generate the cache explicitly:
 ./gradlew :lib:buildSlimWasmtime
 ```
 
-The generated archives live under the ignored `lib/src/native/.deps/slim/` directory. Compact archives are produced for Linux x86_64/ARM64, Windows x86_64, Android arm64/x86_64, macOS x86_64/ARM64, and iOS ARM64. Linux→ARM64 and Linux→Windows cross-builds reuse Kotlin/Native's downloaded target toolchains, so no separate system cross compiler is required. Apple archives require macOS/Xcode because they build against the macOS/iPhoneOS SDKs. Normal native builds generate/reuse these archives automatically and use the private pinned Rust toolchain under `lib/src/native/.deps/`; no global Rust installation is required. `WASMTIME_USE_FULL=1` can select the official full archive on platforms where Wasmtime publishes an ABI-compatible static archive; Windows `mingwX64` and iOS intentionally keep using the compact GNU/Pulley builds. Set `WASMTIME_KEEP_SYMBOLS=1` if native JVM symbols should not be stripped.
+The generated archives live under the ignored `lib/src/native/.deps/slim/` directory. Compact archives are produced for Linux x86_64/ARM64, Windows x86_64, Android arm64/x86_64, macOS x86_64/ARM64, and iOS ARM64. Local developer builds can still cross-build Linux ARM64 and Windows x64 from Linux when the Kotlin/Native target toolchains are available, but release CI deliberately does not: every desktop native publication is built on a runner matching its OS and CPU architecture. Apple archives require macOS/Xcode because they build against the macOS/iPhoneOS SDKs. Normal native builds generate/reuse these archives automatically and use the private pinned Rust toolchain under `lib/src/native/.deps/`; no global Rust installation is required. `WASMTIME_USE_FULL=1` can select the official full archive on platforms where Wasmtime publishes an ABI-compatible static archive; Windows `mingwX64` and iOS intentionally keep using the compact GNU/Pulley builds. Set `WASMTIME_KEEP_SYMBOLS=1` if native JVM symbols should not be stripped.
 
 With the current release build, the size changes are approximately:
 
@@ -604,23 +604,20 @@ plugins {
 }
 ```
 
-`Wasmtime KMP CI and Publish` builds a non-Apple repository shard on Ubuntu and an Apple shard on macOS, merges and verifies them, and uploads the complete Maven directory tree as a workflow artifact. Pushes and pull requests use CI-only versions. Tags such as `v0.1.0` publish automatically; `workflow_dispatch` accepts an explicit version and a `publish` switch. Central publication consumes the exact merged artifact and does not rebuild it.
+`Wasmtime KMP CI and Publish` builds release shards on native platform/architecture runners, then merges and verifies one complete Maven repository. The shards are: architecture-neutral KMP/JVM/Web/WASI/plugin metadata on Ubuntu x64; Linux x64 on `ubuntu-24.04`; Linux ARM64 on `ubuntu-24.04-arm`; Windows x64 on `windows-2025`; macOS x64 on `macos-15-intel`; macOS ARM64 on Apple Silicon `macos-15`; and iOS ARM64 on a separate Apple Silicon macOS job. Android ARM64 and Android x86_64 JNI payloads are also built in separate jobs, then combined into one multi-ABI AAR without rebuilding either payload. Android uses an x64 Linux host because the Android NDK's Linux host package is x86_64-only.
+
+Pushes and pull requests use CI-only versions. Tags such as `v0.1.0` publish automatically; `workflow_dispatch` accepts an explicit version and a `publish` switch. Central publication consumes the exact merged artifact and does not rebuild it.
 
 The workflow uses two GitHub secrets: `GRADLE_PROPERTIES_CONTENT` and `GPG_SECRET_KEY_RING_BASE64`. `GRADLE_PROPERTIES_CONTENT` supplies Maven Central and signing properties, while the base64 secret restores the signing key ring.
 
-To reproduce the non-Apple publication locally:
+To reproduce individual shards locally, point them at separate repository directories. For example, on Linux x64:
 
 ```bash
-export WASMTIME_KMP_VERSION=0.1.0
-export WASMTIME_MAVEN_REPOSITORY="$PWD/release/maven-linux"
-./gradlew \
-  --no-daemon \
-  -PVERSION=0.1.0 \
-  publishWasmtimeNonAppleToMavenRepository
+export WASMTIME_MAVEN_REPOSITORY="$PWD/release/maven-common"
+./gradlew --no-daemon -PVERSION=0.1.0 publishWasmtimeCommonToMavenRepository
 
-python3 scripts/verify-wasmtime-repository.py \
-  release/maven-linux 0.1.0 --allow-missing-apple
-scripts/verify-wasmtime-consumer.sh release/maven-linux 0.1.0
+export WASMTIME_MAVEN_REPOSITORY="$PWD/release/maven-linux-x64"
+./gradlew --no-daemon -PVERSION=0.1.0 publishWasmtimeLinuxX64ToMavenRepository
 ```
 
-On macOS, use the same environment variables with `publishWasmtimeAppleToMavenRepository`. Merge the two repository directories with `scripts/merge-wasmtime-repositories.py`, then run `scripts/verify-wasmtime-repository.py` without `--allow-missing-apple` before signing or publishing.
+The other native shard tasks are `publishWasmtimeLinuxArm64ToMavenRepository`, `publishWasmtimeWindowsX64ToMavenRepository`, `publishWasmtimeMacosX64ToMavenRepository`, `publishWasmtimeMacosArm64ToMavenRepository`, and `publishWasmtimeIosArm64ToMavenRepository`. Android CI builds `:lib:buildAndroidArm64NativeBridge` and `:lib:buildAndroidX64NativeBridge` separately, then packages them with `publishWasmtimeAndroidToMavenRepository -PwasmtimeAndroidPrebuilt=true`. Merge all repository shard directories with `scripts/merge-wasmtime-repositories.py`, then run `scripts/verify-wasmtime-repository.py` and `scripts/verify-wasmtime-consumer.sh` on the merged repository before signing or publishing.

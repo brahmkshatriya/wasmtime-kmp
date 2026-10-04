@@ -3,7 +3,6 @@ import org.gradle.api.attributes.Attribute
 import org.gradle.api.attributes.Category
 import org.gradle.api.attributes.LibraryElements
 import org.gradle.api.attributes.Usage
-import org.gradle.api.publish.maven.MavenPublication
 import org.gradle.api.tasks.TaskProvider
 import org.gradle.jvm.tasks.Jar
 
@@ -87,14 +86,30 @@ val buildSlimWasmtimeIosArm64 = tasks.register<Exec>("buildSlimWasmtimeIosArm64"
     outputs.file(slimWasmtimeIosArm64)
 }
 
-val buildSlimWasmtimeAndroid = tasks.register<Exec>("buildSlimWasmtimeAndroid") {
+val buildSlimWasmtimeAndroidArm64 = tasks.register<Exec>("buildSlimWasmtimeAndroidArm64") {
     workingDir(rootProject.projectDir)
-    commandLine("bash", project.file("src/native/build-slim-wasmtime.sh"), "android-all")
+    commandLine("bash", project.file("src/native/build-slim-wasmtime.sh"), "android-arm64")
     inputs.file(project.file("src/native/build-slim-wasmtime.sh"))
     inputs.property("wasmtimeVersion", providers.environmentVariable("WASMTIME_VERSION").orElse("49.0.1"))
     inputs.property("rustVersion", providers.environmentVariable("WASMTIME_RUST_VERSION").orElse("1.96.0"))
     inputs.property("compilerOptLevel", wasmtimeCompilerOptLevel)
-    outputs.files(slimWasmtimeAndroidArm64, slimWasmtimeAndroidX64)
+    outputs.file(slimWasmtimeAndroidArm64)
+}
+
+val buildSlimWasmtimeAndroidX64 = tasks.register<Exec>("buildSlimWasmtimeAndroidX64") {
+    workingDir(rootProject.projectDir)
+    commandLine("bash", project.file("src/native/build-slim-wasmtime.sh"), "android-x86_64")
+    inputs.file(project.file("src/native/build-slim-wasmtime.sh"))
+    inputs.property("wasmtimeVersion", providers.environmentVariable("WASMTIME_VERSION").orElse("49.0.1"))
+    inputs.property("rustVersion", providers.environmentVariable("WASMTIME_RUST_VERSION").orElse("1.96.0"))
+    inputs.property("compilerOptLevel", wasmtimeCompilerOptLevel)
+    outputs.file(slimWasmtimeAndroidX64)
+}
+
+val buildSlimWasmtimeAndroid = tasks.register("buildSlimWasmtimeAndroid") {
+    group = "build"
+    description = "Build compact Wasmtime archives for both Android ABIs."
+    dependsOn(buildSlimWasmtimeAndroidArm64, buildSlimWasmtimeAndroidX64)
 }
 
 tasks.register("buildSlimWasmtime") {
@@ -232,12 +247,10 @@ val testNativeSecurity = tasks.register<Exec>("testNativeSecurity") {
     )
 }
 
-tasks.register<Exec>("buildAndroidNativeBridge") {
-    if (useFullWasmtime.get() != "1") {
-        dependsOn(buildSlimWasmtimeAndroid)
-    }
+val buildAndroidArm64NativeBridge = tasks.register<Exec>("buildAndroidArm64NativeBridge") {
+    if (useFullWasmtime.get() != "1") dependsOn(buildSlimWasmtimeAndroidArm64)
     workingDir(rootProject.projectDir)
-    commandLine("bash", project.file("src/native/build.sh"), "android-all")
+    commandLine("bash", project.file("src/native/build.sh"), "android-arm64")
     inputs.files(
         project.file("src/native/build.sh"),
         project.file("src/native/wasmtime_kmp.h"),
@@ -246,7 +259,40 @@ tasks.register<Exec>("buildAndroidNativeBridge") {
         project.file("src/native/wasi_lite.c"),
     )
     trackOptionalSlimArchive(slimWasmtimeAndroidArm64)
+    outputs.file(layout.buildDirectory.file("generated/jniLibs/arm64-v8a/libwasmtime_kmp.so"))
+}
+
+val buildAndroidX64NativeBridge = tasks.register<Exec>("buildAndroidX64NativeBridge") {
+    if (useFullWasmtime.get() != "1") dependsOn(buildSlimWasmtimeAndroidX64)
+    workingDir(rootProject.projectDir)
+    commandLine("bash", project.file("src/native/build.sh"), "android-x86_64")
+    inputs.files(
+        project.file("src/native/build.sh"),
+        project.file("src/native/wasmtime_kmp.h"),
+        project.file("src/native/wasmtime_kmp.c"),
+        project.file("src/native/wasi_lite.h"),
+        project.file("src/native/wasi_lite.c"),
+    )
     trackOptionalSlimArchive(slimWasmtimeAndroidX64)
+    outputs.file(layout.buildDirectory.file("generated/jniLibs/x86_64/libwasmtime_kmp.so"))
+}
+
+val usePrebuiltAndroidNative = providers.gradleProperty("wasmtimeAndroidPrebuilt")
+    .map(String::toBoolean)
+    .orElse(false)
+
+val buildAndroidNativeBridge = tasks.register("buildAndroidNativeBridge") {
+    group = "build"
+    description = "Prepare both Android JNI payloads, or validate prebuilt CI payloads."
+    if (!usePrebuiltAndroidNative.get()) {
+        dependsOn(buildAndroidArm64NativeBridge, buildAndroidX64NativeBridge)
+    }
+    doLast {
+        val arm64 = layout.buildDirectory.file("generated/jniLibs/arm64-v8a/libwasmtime_kmp.so").get().asFile
+        val x64 = layout.buildDirectory.file("generated/jniLibs/x86_64/libwasmtime_kmp.so").get().asFile
+        check(arm64.isFile && arm64.length() > 0) { "Missing Android ARM64 JNI payload: $arm64" }
+        check(x64.isFile && x64.length() > 0) { "Missing Android x86_64 JNI payload: $x64" }
+    }
     outputs.dir(layout.buildDirectory.dir("generated/jniLibs"))
 }
 
@@ -319,6 +365,36 @@ val jvmLinuxArm64NativeJar = tasks.register<Jar>("jvmLinuxArm64NativeJar") {
         into("native/linux-arm64")
     }
 }
+
+val wasmtimeMavenRepository = providers.gradleProperty("wasmtimeMavenRepository")
+    .orElse(providers.environmentVariable("WASMTIME_MAVEN_REPOSITORY"))
+
+fun registerJvmClassifierRepositoryCopy(
+    taskName: String,
+    jarTask: TaskProvider<Jar>,
+) = tasks.register(taskName) {
+    group = "publishing"
+    dependsOn(jarTask)
+    doLast {
+        val repository = file(wasmtimeMavenRepository.get())
+        val destination = repository
+            .resolve(project.group.toString().replace('.', '/'))
+            .resolve("${project.name}-jvm")
+            .resolve(project.version.toString())
+        destination.mkdirs()
+        val source = jarTask.get().archiveFile.get().asFile
+        source.copyTo(destination.resolve(source.name), overwrite = true)
+    }
+}
+
+registerJvmClassifierRepositoryCopy(
+    "copyJvmLinuxX64ClassifierToWasmtimeRepository",
+    jvmLinuxX64NativeJar,
+)
+registerJvmClassifierRepositoryCopy(
+    "copyJvmLinuxArm64ClassifierToWasmtimeRepository",
+    jvmLinuxArm64NativeJar,
+)
 
 val jvmNativeArchAttribute = Attribute.of(
     "dev.brahmkshatriya.wasmtime.jvm.native.arch",
@@ -535,11 +611,4 @@ val verifyAppleNativeLink = tasks.register("verifyAppleNativeLink") {
 
 if (System.getProperty("os.name").lowercase().contains("linux")) {
     tasks.named("check").configure { dependsOn(testNativeSecurity) }
-}
-
-publishing {
-    publications.withType<MavenPublication>().matching { it.name == "jvm" }.configureEach {
-        artifact(jvmLinuxX64NativeJar)
-        artifact(jvmLinuxArm64NativeJar)
-    }
 }

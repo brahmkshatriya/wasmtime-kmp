@@ -41,7 +41,37 @@ find_konan_dependency() {
     exit 1
 }
 
+is_windows_host() {
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+find_windows_native_tool() {
+    local tool="$1"
+    local override_var="WASMTIME_WINDOWS_${tool^^}"
+    local override="${!override_var:-}"
+    if [[ -n "$override" ]]; then
+        [[ -x "$override" ]] || { echo "$override_var is not executable: $override" >&2; exit 1; }
+        printf '%s\n' "$override"
+        return
+    fi
+    local bin="${WASMTIME_WINDOWS_TOOLCHAIN_BIN:-C:/msys64/mingw64/bin}"
+    local candidate="$bin/$tool.exe"
+    if [[ -x "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return
+    fi
+    command -v "$tool" >/dev/null 2>&1 || { echo "Windows native tool not found: $tool" >&2; exit 1; }
+    command -v "$tool"
+}
+
 create_windows_linker() {
+    if is_windows_host; then
+        find_windows_native_tool gcc
+        return
+    fi
     local mingw="$(find_konan_dependency 'msys2-mingw-w64-x86_64-*')"
     local llvm="$(find_konan_dependency 'llvm-*-x86_64-linux-essentials-*')"
     local clang="$llvm/bin/clang"
@@ -50,8 +80,8 @@ create_windows_linker() {
     mkdir -p "$(dirname "$wrapper")"
     cat > "$wrapper" <<EOF
 #!/usr/bin/env bash
-exec "$clang" --target=x86_64-w64-windows-gnu --sysroot="$mingw" \\
-  -isystem "$mingw/x86_64-w64-mingw32/include" \\
+exec "$clang" --target=x86_64-w64-windows-gnu --sysroot="$mingw" \
+  -isystem "$mingw/x86_64-w64-mingw32/include" \
   -L"$mingw/x86_64-w64-mingw32/lib" -L"$mingw/lib" "\$@"
 EOF
     chmod +x "$wrapper"
@@ -193,6 +223,13 @@ find_linux_arm64_tool() {
         printf '%s\n' "$override"
         return
     fi
+    case "$(uname -m)" in
+        aarch64|arm64)
+            command -v "$tool" >/dev/null 2>&1 || { echo "Native ARM64 tool not found: $tool" >&2; exit 1; }
+            command -v "$tool"
+            return
+            ;;
+    esac
     local path_tool="aarch64-unknown-linux-gnu-$tool"
     if command -v "$path_tool" >/dev/null 2>&1; then
         command -v "$path_tool"
@@ -294,10 +331,15 @@ case "${1:-all}" in
         ;;
     windows-x64)
         linker="$(create_windows_linker)"
-        llvm="$(find_konan_dependency 'llvm-*-x86_64-linux-essentials-*')"
+        if is_windows_host; then
+            archiver="$(find_windows_native_tool ar)"
+        else
+            llvm="$(find_konan_dependency 'llvm-*-x86_64-linux-essentials-*')"
+            archiver="$llvm/bin/llvm-ar"
+        fi
         WASMTIME_TARGET_CMAKE_ARGS="-DCMAKE_SYSTEM_NAME=Windows" \
             build_target x86_64-windows-gnu x86_64-pc-windows-gnu \
-            "$linker" "$llvm/bin/llvm-ar"
+            "$linker" "$archiver"
         ;;
     macos-x64)
         linker="$(create_apple_linker macosx x86_64)"

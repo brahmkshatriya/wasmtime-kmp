@@ -67,29 +67,63 @@ subprojects {
     }
 }
 
-tasks.register("publishWasmtimeNonAppleToMavenRepository") {
+tasks.register("publishWasmtimeCommonToMavenRepository") {
     group = "publishing"
-    description = "Publish the Wasmtime KMP root, Linux/Windows/Android/JVM/Web targets, guest runtime, and Gradle plugins."
+    description = "Publish architecture-neutral KMP/JVM/Web/WASI metadata and Gradle plugins."
     dependsOn(
         ":lib:publishKotlinMultiplatformPublicationToWasmtimeRepository",
-        ":lib:publishAndroidPublicationToWasmtimeRepository",
         ":lib:publishJvmPublicationToWasmtimeRepository",
         ":lib:publishWasmJsPublicationToWasmtimeRepository",
-        ":lib:publishLinuxX64PublicationToWasmtimeRepository",
-        ":lib:publishLinuxArm64PublicationToWasmtimeRepository",
-        ":lib:publishMingwX64PublicationToWasmtimeRepository",
         ":lib:guest-runtime:publishKotlinMultiplatformPublicationToWasmtimeRepository",
         ":lib:guest-runtime:publishWasmWasiPublicationToWasmtimeRepository",
     )
     dependsOn(gradle.includedBuild("gradle-plugin").task(":publishAllPublicationsToWasmtimeRepository"))
 }
 
-tasks.register("publishWasmtimeAppleToMavenRepository") {
+tasks.register("publishWasmtimeAndroidToMavenRepository") {
     group = "publishing"
-    description = "Publish the macOS x64/ARM64 and iOS ARM64 Wasmtime KMP target artifacts."
+    description = "Publish the Android AAR with both supported Android ABIs."
+    dependsOn(":lib:publishAndroidPublicationToWasmtimeRepository")
+}
+
+tasks.register("publishWasmtimeLinuxX64ToMavenRepository") {
+    group = "publishing"
+    description = "Publish Linux x64 and its JVM Linux x64 runtime classifier."
     dependsOn(
-        ":lib:publishMacosX64PublicationToWasmtimeRepository",
-        ":lib:publishMacosArm64PublicationToWasmtimeRepository",
-        ":lib:publishIosArm64PublicationToWasmtimeRepository",
+        ":lib:publishLinuxX64PublicationToWasmtimeRepository",
+        ":lib:copyJvmLinuxX64ClassifierToWasmtimeRepository",
     )
+}
+
+tasks.register("publishWasmtimeLinuxArm64ToMavenRepository") {
+    group = "publishing"
+    description = "Publish Linux ARM64 and its JVM Linux ARM64 runtime classifier."
+    dependsOn(
+        ":lib:publishLinuxArm64PublicationToWasmtimeRepository",
+        ":lib:copyJvmLinuxArm64ClassifierToWasmtimeRepository",
+    )
+}
+
+tasks.register("publishWasmtimeWindowsX64ToMavenRepository") {
+    group = "publishing"
+    description = "Publish Windows x64 on a native Windows runner."
+    dependsOn(":lib:publishMingwX64PublicationToWasmtimeRepository")
+}
+
+tasks.register("publishWasmtimeMacosX64ToMavenRepository") {
+    group = "publishing"
+    description = "Publish macOS x64 on an Intel macOS runner."
+    dependsOn(":lib:publishMacosX64PublicationToWasmtimeRepository")
+}
+
+tasks.register("publishWasmtimeMacosArm64ToMavenRepository") {
+    group = "publishing"
+    description = "Publish macOS ARM64 on an Apple Silicon runner."
+    dependsOn(":lib:publishMacosArm64PublicationToWasmtimeRepository")
+}
+
+tasks.register("publishWasmtimeIosArm64ToMavenRepository") {
+    group = "publishing"
+    description = "Publish iOS ARM64 on an Apple Silicon macOS runner."
+    dependsOn(":lib:publishIosArm64PublicationToWasmtimeRepository")
 }
