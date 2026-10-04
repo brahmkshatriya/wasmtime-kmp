@@ -1,0 +1,37 @@
+[versions]
+kotlin = "2.4.20"
+agp = "9.3.3"
+compose = "1.13.0-alpha01"
+composeNative = "1.13.0-alpha09"
+compileSdk = "37"
+kotlinCoroutines = "1.9.0"
+kotlinSerialization = "1.11.0"
+
+[libraries]
+compose-android-runtime = { module = "org.jetbrains.compose.runtime:runtime", version.ref = "compose" }
+compose-android-ui = { module = "org.jetbrains.compose.ui:ui", version.ref = "compose" }
+compose-android-foundation = { module = "org.jetbrains.compose.foundation:foundation", version.ref = "compose" }
+compose-android-material3 = { module = "org.jetbrains.compose.material3:material3", version.ref = "compose" }
+compose-android-components-resources = { module = "org.jetbrains.compose.components:components-resources", version.ref = "compose" }
+compose-native-runtime = { module = "dev.brahmkshatriya.compose.runtime:runtime", version.ref = "composeNative" }
+compose-native-ui = { module = "dev.brahmkshatriya.compose.ui:ui", version.ref = "composeNative" }
+compose-native-foundation = { module = "dev.brahmkshatriya.compose.foundation:foundation", version.ref = "composeNative" }
+compose-native-material3 = { module = "dev.brahmkshatriya.compose.material3:material3", version.ref = "composeNative" }
+compose-native-components-resources = { module = "dev.brahmkshatriya.compose.components:components-resources", version.ref = "composeNative" }
+compose-native-desktop = { module = "dev.brahmkshatriya.compose.desktop:desktop-native", version.ref = "composeNative" }
+androidx-activity-compose = { module = "androidx.activity:activity-compose", version = "1.13.0" }
+kotlin-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinCoroutines" }
+kotlin-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinSerialization" }
+
+[bundles]
+compose-android = ["compose-android-runtime", "compose-android-ui", "compose-android-foundation", "compose-android-material3", "compose-android-components-resources"]
+compose-native = ["compose-native-runtime", "compose-native-ui", "compose-native-foundation", "compose-native-material3", "compose-native-components-resources"]
+
+[plugins]
+kotlinMultiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
+composeMultiplatform = { id = "org.jetbrains.compose", version.ref = "compose" }
+composeCompiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+composeNative = { id = "dev.brahmkshatriya.compose", version.ref = "composeNative" }
+androidKMPLibrary = { id = "com.android.kotlin.multiplatform.library", version.ref = "agp" }
+androidApplication = { id = "com.android.application", version.ref = "agp" }
+kotlinSerialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }

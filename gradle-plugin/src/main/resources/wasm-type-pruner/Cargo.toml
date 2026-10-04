@@ -1,0 +1,9 @@
+[package]
+name = "wasm-type-pruner"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+wasm-encoder = { version = "=0.258.0", features = ["wasmparser"] }
+wasmparser = "=0.258.0"

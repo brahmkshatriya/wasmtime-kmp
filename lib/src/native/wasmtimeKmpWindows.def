@@ -1,0 +1,1 @@
+linkerOpts = -lbcrypt -luserenv -lntdll -lws2_32 -ladvapi32 -lshell32 -lole32

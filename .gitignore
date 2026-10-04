@@ -1,0 +1,16 @@
+.gradle/
+.idea/
+.kotlin/
+**/build/
+local.properties
+.bootstrap/
+lib/src/native/.deps/
+.ktor-m2/
+
+release/
+
+# Local tool/runtime outputs
+kotlin-js-store/
+hs_err_pid*.log
+*.hprof
+core.*

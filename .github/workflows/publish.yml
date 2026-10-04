@@ -1,0 +1,361 @@
+name: Wasmtime KMP CI and Publish
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/publish.yml"
+      - "build.gradle.kts"
+      - "gradle-plugin/**"
+      - "gradle/**"
+      - "gradle.properties"
+      - "gradlew"
+      - "gradlew.bat"
+      - "lib/**"
+      - "settings.gradle.kts"
+      - "scripts/**"
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v[0-9]*"
+      - "[0-9]*"
+    paths:
+      - ".github/workflows/publish.yml"
+      - "build.gradle.kts"
+      - "gradle-plugin/**"
+      - "gradle/**"
+      - "gradle.properties"
+      - "gradlew"
+      - "gradlew.bat"
+      - "lib/**"
+      - "settings.gradle.kts"
+      - "scripts/**"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Maven version (required when publishing)"
+        required: false
+        type: string
+      publish:
+        description: "Publish the merged repository to Maven Central"
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: wasmtime-kmp-${{ github.ref }}-${{ inputs.version || github.run_id }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && !(github.event_name == 'workflow_dispatch' && inputs.publish) }}
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Resolve publication version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - name: Resolve and validate version
+        id: version
+        shell: bash
+        env:
+          MANUAL_VERSION: ${{ inputs.version }}
+          MANUAL_PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          publish=false
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "$MANUAL_PUBLISH" == "true" ]]; then
+              publish=true
+              if [[ -z "$MANUAL_VERSION" ]]; then
+                echo "A version is required for manual publication" >&2
+                exit 1
+              fi
+            fi
+            version="${MANUAL_VERSION:-0.1.0-ci.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}}"
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            publish=true
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.1.0-ci.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+          fi
+
+          if [[ ! "$version" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
+            echo "Invalid Maven version: $version" >&2
+            exit 1
+          fi
+          if [[ "$version" == *SNAPSHOT* ]]; then
+            echo "SNAPSHOT versions are not allowed in isolated publication repositories" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "Publication version: $version"
+          echo "Publish to Central: $publish"
+
+  linux:
+    name: Build Linux/Android/JVM/Web/Windows repository
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android platform and NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager "platforms;android-37" "ndk;29.0.14206865"
+
+      - name: Cache slim Wasmtime toolchains and archives
+        uses: actions/cache@v4
+        with:
+          path: |
+            lib/src/native/.deps/cargo
+            lib/src/native/.deps/rustup
+            lib/src/native/.deps/slim
+            lib/src/native/.deps/slim-target
+          key: wasmtime-slim-${{ runner.os }}-${{ runner.arch }}-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
+
+      - name: Build isolated non-Apple Maven repository
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          WASMTIME_KMP_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          repository="$GITHUB_WORKSPACE/release/linux-repository"
+          rm -rf "$repository"
+          export WASMTIME_MAVEN_REPOSITORY="$repository"
+          ./gradlew \
+            --no-daemon \
+            --stacktrace \
+            --no-configuration-cache \
+            "-PVERSION=$RELEASE_VERSION" \
+            publishWasmtimeNonAppleToMavenRepository
+
+      - name: Verify non-Apple Maven repository
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-wasmtime-repository.py \
+            release/linux-repository "$RELEASE_VERSION" --allow-missing-apple
+          bash scripts/verify-wasmtime-consumer.sh \
+            release/linux-repository "$RELEASE_VERSION"
+          du -sh release/linux-repository
+
+      - name: Upload non-Apple Maven repository
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasmtime-kmp-repo-linux-${{ needs.prepare.outputs.version }}
+          path: release/linux-repository
+          if-no-files-found: error
+          retention-days: 7
+
+  apple:
+    name: Build macOS/iOS repository
+    needs: prepare
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Cache slim Wasmtime toolchains and archives
+        uses: actions/cache@v4
+        with:
+          path: |
+            lib/src/native/.deps/cargo
+            lib/src/native/.deps/rustup
+            lib/src/native/.deps/slim
+            lib/src/native/.deps/slim-target
+          key: wasmtime-slim-${{ runner.os }}-${{ runner.arch }}-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
+
+      - name: Build isolated Apple Maven repository
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          repository="$GITHUB_WORKSPACE/release/apple-repository"
+          rm -rf "$repository"
+          export WASMTIME_MAVEN_REPOSITORY="$repository"
+          ./gradlew \
+            --no-daemon \
+            --stacktrace \
+            --no-configuration-cache \
+            "-PVERSION=$RELEASE_VERSION" \
+            publishWasmtimeAppleToMavenRepository
+
+      - name: Verify Apple target set
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          base="release/apple-repository/dev/brahmkshatriya/wasmtime"
+          expected=(lib-iosarm64 lib-macosarm64 lib-macosx64)
+          for artifact_dir in "$base"/*; do
+            [[ -d "$artifact_dir" ]] || continue
+            basename "$artifact_dir"
+          done | sort > "$RUNNER_TEMP/actual.txt"
+          printf '%s\n' "${expected[@]}" | sort > "$RUNNER_TEMP/expected.txt"
+          diff -u "$RUNNER_TEMP/expected.txt" "$RUNNER_TEMP/actual.txt"
+          for artifact in "${expected[@]}"; do
+            version_dir="$base/$artifact/$RELEASE_VERSION"
+            test -s "$version_dir/$artifact-$RELEASE_VERSION.klib"
+            test -s "$version_dir/$artifact-$RELEASE_VERSION.pom"
+            test -s "$version_dir/$artifact-$RELEASE_VERSION.module"
+            test -s "$version_dir/$artifact-$RELEASE_VERSION-sources.jar"
+            test -s "$version_dir/$artifact-$RELEASE_VERSION-javadoc.jar"
+          done
+          du -sh release/apple-repository
+
+      - name: Upload Apple Maven repository
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasmtime-kmp-repo-apple-${{ needs.prepare.outputs.version }}
+          path: release/apple-repository
+          if-no-files-found: error
+          retention-days: 7
+
+  merge:
+    name: Merge and verify complete Maven repository
+    needs:
+      - prepare
+      - linux
+      - apple
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Download non-Apple repository
+        uses: actions/download-artifact@v4
+        with:
+          name: wasmtime-kmp-repo-linux-${{ needs.prepare.outputs.version }}
+          path: release/shards/linux
+
+      - name: Download Apple repository
+        uses: actions/download-artifact@v4
+        with:
+          name: wasmtime-kmp-repo-apple-${{ needs.prepare.outputs.version }}
+          path: release/shards/apple
+
+      - name: Merge and verify repository
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 scripts/merge-wasmtime-repositories.py \
+            release/maven-repository \
+            release/shards/linux \
+            release/shards/apple
+          python3 scripts/verify-wasmtime-repository.py \
+            release/maven-repository "$RELEASE_VERSION"
+          bash scripts/verify-wasmtime-consumer.sh \
+            release/maven-repository "$RELEASE_VERSION"
+          du -sh release/maven-repository
+
+      - name: Upload complete Maven repository
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasmtime-kmp-maven-repo-${{ needs.prepare.outputs.version }}
+          path: release/maven-repository
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish exact repository to Maven Central
+    if: needs.prepare.outputs.publish == 'true'
+    needs:
+      - prepare
+      - merge
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7.0.1
+
+      - name: Download complete Maven repository
+        uses: actions/download-artifact@v4
+        with:
+          name: wasmtime-kmp-maven-repo-${{ needs.prepare.outputs.version }}
+          path: release/maven-repository
+
+      - name: Restore Gradle properties and signing key
+        shell: bash
+        env:
+          GRADLE_PROPERTIES_CONTENT: ${{ secrets.GRADLE_PROPERTIES_CONTENT }}
+          GPG_SECRET_KEY_RING_BASE64: ${{ secrets.GPG_SECRET_KEY_RING_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$GRADLE_PROPERTIES_CONTENT"
+          test -n "$GPG_SECRET_KEY_RING_BASE64"
+          gradle_dir="$HOME/.gradle"
+          properties_file="$gradle_dir/gradle.properties"
+          keyring="$gradle_dir/wasmtime-kmp-secret-key.gpg"
+          mkdir -p "$gradle_dir"
+          printf '%s' "$GRADLE_PROPERTIES_CONTENT" > "$properties_file"
+          printf '%s' "$GPG_SECRET_KEY_RING_BASE64" | tr -d '\r\n ' | openssl base64 -d -A > "$keyring"
+          test -s "$keyring"
+          awk '!/^signing.secretKeyRingFile=/' "$properties_file" > "$properties_file.tmp"
+          mv "$properties_file.tmp" "$properties_file"
+          printf '\nsigning.secretKeyRingFile=%s\n' "$keyring" >> "$properties_file"
+          chmod 600 "$properties_file" "$keyring"
+
+      - name: Sign and publish one Central deployment
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          bash scripts/publish-wasmtime-central-bundle.sh \
+            "$GITHUB_WORKSPACE/release/maven-repository" \
+            "$RELEASE_VERSION" \
+            "$GITHUB_WORKSPACE/release/wasmtime-kmp-$RELEASE_VERSION.zip"
+
+      - name: Preserve failed Central bundle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-wasmtime-kmp-central-bundle-${{ needs.prepare.outputs.version }}
+          path: release/wasmtime-kmp-${{ needs.prepare.outputs.version }}.zip
+          if-no-files-found: ignore
+          retention-days: 7
