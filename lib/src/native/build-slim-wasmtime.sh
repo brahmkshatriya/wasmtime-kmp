@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+upper_ascii() {
+    printf '%s' "$1" | tr '[:lower:]' '[:upper:]'
+}
+
 NATIVE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION="${WASMTIME_VERSION:-49.0.1}"
 RUST_VERSION="${WASMTIME_RUST_VERSION:-1.96.0}"
@@ -50,7 +54,7 @@ is_windows_host() {
 
 find_windows_native_tool() {
     local tool="$1"
-    local override_var="WASMTIME_WINDOWS_${tool^^}"
+    local override_var="WASMTIME_WINDOWS_$(upper_ascii "$tool")"
     local override="${!override_var:-}"
     if [[ -n "$override" ]]; then
         [[ -x "$override" ]] || { echo "$override_var is not executable: $override" >&2; exit 1; }
@@ -118,6 +122,12 @@ require_tool() {
 }
 
 ensure_rust_toolchain() {
+    if is_windows_host; then
+        require_tool cargo
+        require_tool rustup
+        return
+    fi
+
     mkdir -p "$DEPS"
     if [[ ! -x "$PRIVATE_CARGO/bin/cargo" || ! -x "$PRIVATE_CARGO/bin/rustup" ]]; then
         require_tool curl
@@ -216,7 +226,7 @@ ensure_rust_target() {
 
 find_linux_arm64_tool() {
     local tool="$1"
-    local override_var="WASMTIME_LINUX_ARM64_${tool^^}"
+    local override_var="WASMTIME_LINUX_ARM64_$(upper_ascii "$tool")"
     local override="${!override_var:-}"
     if [[ -n "$override" ]]; then
         [[ -x "$override" ]] || { echo "$override_var is not executable: $override" >&2; exit 1; }
@@ -284,7 +294,9 @@ build_target() {
             exit 1
         fi
         local env_suffix="${rust_target//-/_}"
-        export "CARGO_TARGET_${env_suffix^^}_LINKER=$target_cc"
+        local env_suffix_upper
+        env_suffix_upper="$(upper_ascii "$env_suffix")"
+        export "CARGO_TARGET_${env_suffix_upper}_LINKER=$target_cc"
         export "CC_${env_suffix}=$target_cc"
         if [[ -n "$target_ar" ]]; then
             [[ -x "$target_ar" ]] || { echo "Target archiver not found: $target_ar" >&2; exit 1; }

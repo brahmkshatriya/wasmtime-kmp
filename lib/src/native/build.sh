@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+upper_ascii() {
+    printf '%s' "$1" | tr '[:lower:]' '[:upper:]'
+}
+
 NATIVE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$NATIVE_DIR/../../.." && pwd)"
 VERSION="${WASMTIME_VERSION:-49.0.1}"
@@ -39,7 +43,7 @@ select_wasmtime_archive() {
 
 find_linux_arm64_tool() {
     local tool="$1"
-    local override_var="WASMTIME_LINUX_ARM64_${tool^^}"
+    local override_var="WASMTIME_LINUX_ARM64_$(upper_ascii "$tool")"
     local override="${!override_var:-}"
     if [[ -n "$override" ]]; then
         [[ -x "$override" ]] || { echo "$override_var is not executable: $override" >&2; exit 1; }
@@ -88,7 +92,7 @@ is_windows_host() {
 
 find_windows_native_tool() {
     local tool="$1"
-    local override_var="WASMTIME_WINDOWS_${tool^^}"
+    local override_var="WASMTIME_WINDOWS_$(upper_ascii "$tool")"
     local override="${!override_var:-}"
     if [[ -n "$override" ]]; then
         [[ -x "$override" ]] || { echo "$override_var is not executable: $override" >&2; exit 1; }

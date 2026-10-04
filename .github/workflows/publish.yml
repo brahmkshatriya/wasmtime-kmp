@@ -116,6 +116,7 @@ jobs:
         shell: bash
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          WASMTIME_KMP_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
           repository="$GITHUB_WORKSPACE/release/common-repository"
@@ -225,19 +226,19 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: wasmtime-kmp-android-arm64-${{ needs.prepare.outputs.version }}
-          path: lib/build/generated/jniLibs/arm64-v8a
+          path: lib/.ci-prebuilt/android-jni/arm64-v8a
       - uses: actions/download-artifact@v4
         with:
           name: wasmtime-kmp-android-x64-${{ needs.prepare.outputs.version }}
-          path: lib/build/generated/jniLibs/x86_64
+          path: lib/.ci-prebuilt/android-jni/x86_64
       - name: Publish Android AAR from prebuilt ABI payloads
         shell: bash
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          test -s lib/build/generated/jniLibs/arm64-v8a/libwasmtime_kmp.so
-          test -s lib/build/generated/jniLibs/x86_64/libwasmtime_kmp.so
+          test -s lib/.ci-prebuilt/android-jni/arm64-v8a/libwasmtime_kmp.so
+          test -s lib/.ci-prebuilt/android-jni/x86_64/libwasmtime_kmp.so
           repository="$GITHUB_WORKSPACE/release/android-repository"
           rm -rf "$repository"
           export WASMTIME_MAVEN_REPOSITORY="$repository"
@@ -305,18 +306,13 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  linux_arm64:
-    name: Build Linux ARM64 repository
+  linux_arm64_native:
+    name: Build Linux ARM64 native payloads
     needs: prepare
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-java@v6.0.1
-        with:
-          distribution: temurin
-          java-version: 21
-      - uses: gradle/actions/setup-gradle@v6
       - uses: actions/cache@v4
         with:
           path: |
@@ -324,19 +320,63 @@ jobs:
             lib/src/native/.deps/rustup
             lib/src/native/.deps/slim/aarch64-linux
             lib/src/native/.deps/slim-target/aarch64-linux
-          key: wasmtime-linux-arm64-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
-      - name: Publish Linux ARM64 artifact and JVM classifier
+          key: wasmtime-linux-arm64-native-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
+      - name: Build native ARM64 Wasmtime, Kotlin/Native bridge archives and JVM runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          bash lib/src/native/build-slim-wasmtime.sh linux-arm64
+          bash lib/src/native/build.sh linux-arm64
+          bash lib/src/native/build.sh jvm-linux-arm64
+          test -s lib/build/native/linuxArm64/libwasmtime_kmp_bridge.a
+          test -s lib/build/native/linuxArm64/libwasmtime.a
+          test -s lib/build/native/jvmLinuxArm64/libwasmtime_kmp.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasmtime-kmp-linux-arm64-native-${{ needs.prepare.outputs.version }}
+          path: |
+            lib/build/native/linuxArm64
+            lib/build/native/jvmLinuxArm64
+          if-no-files-found: error
+          retention-days: 7
+
+  linux_arm64:
+    name: Package Linux ARM64 KLIB repository
+    needs:
+      - prepare
+      - linux_arm64_native
+    # Kotlin/Native 2.4.x cannot execute on Linux ARM64 hosts. The C/Wasmtime
+    # payload above is built natively on ARM64; only the Kotlin/Native KLIB
+    # compilation/publishing step runs on the supported Linux x64 compiler host.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasmtime-kmp-linux-arm64-native-${{ needs.prepare.outputs.version }}
+          path: lib/build/native
+      - name: Publish Linux ARM64 KLIB and package the native JVM ARM64 classifier
         shell: bash
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          test "$(uname -m)" = "aarch64"
+          test -s lib/build/native/linuxArm64/libwasmtime_kmp_bridge.a
+          test -s lib/build/native/linuxArm64/libwasmtime.a
+          test -s lib/build/native/jvmLinuxArm64/libwasmtime_kmp.so
           repository="$GITHUB_WORKSPACE/release/linux-arm64-repository"
           rm -rf "$repository"
           export WASMTIME_MAVEN_REPOSITORY="$repository"
           ./gradlew --no-daemon --stacktrace --no-configuration-cache \
             "-PVERSION=$RELEASE_VERSION" \
+            -PwasmtimeLinuxArm64Prebuilt=true \
             publishWasmtimeLinuxArm64ToMavenRepository
           test -s "$repository/dev/brahmkshatriya/wasmtime/lib-linuxarm64/$RELEASE_VERSION/lib-linuxarm64-$RELEASE_VERSION.klib"
           classifier="$repository/dev/brahmkshatriya/wasmtime/lib-jvm/$RELEASE_VERSION/lib-jvm-$RELEASE_VERSION-linux-arm64.jar"
@@ -374,6 +414,7 @@ jobs:
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
           WASMTIME_WINDOWS_TOOLCHAIN_BIN: C:/msys64/mingw64/bin
+          WASMTIME_BASH: C:/Program Files/Git/bin/bash.exe
           CMAKE_GENERATOR: Ninja
         run: |
           set -euo pipefail
