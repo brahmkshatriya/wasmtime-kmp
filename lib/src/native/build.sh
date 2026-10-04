@@ -99,6 +99,11 @@ find_windows_native_tool() {
         printf '%s\n' "$override"
         return
     fi
+    if is_windows_host; then
+        command -v "$tool" >/dev/null 2>&1 || { echo "Windows native tool not found: $tool" >&2; exit 1; }
+        printf '%s\n' "$tool"
+        return
+    fi
     local bin="${WASMTIME_WINDOWS_TOOLCHAIN_BIN:-C:/msys64/mingw64/bin}"
     local candidate="$bin/$tool.exe"
     if [[ -x "$candidate" ]]; then

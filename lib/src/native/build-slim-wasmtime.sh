@@ -61,6 +61,11 @@ find_windows_native_tool() {
         printf '%s\n' "$override"
         return
     fi
+    if is_windows_host; then
+        command -v "$tool" >/dev/null 2>&1 || { echo "Windows native tool not found: $tool" >&2; exit 1; }
+        printf '%s\n' "$tool"
+        return
+    fi
     local bin="${WASMTIME_WINDOWS_TOOLCHAIN_BIN:-C:/msys64/mingw64/bin}"
     local candidate="$bin/$tool.exe"
     if [[ -x "$candidate" ]]; then
@@ -289,9 +294,10 @@ build_target() {
     export CARGO_PROFILE_RELEASE_OPT_LEVEL=3
 
     if [[ -n "$target_cc" ]]; then
-        if [[ ! -x "$target_cc" ]]; then
-            echo "Target compiler not found: $target_cc" >&2
-            exit 1
+        if [[ "$target_cc" == */* ]]; then
+            [[ -x "$target_cc" ]] || { echo "Target compiler not found: $target_cc" >&2; exit 1; }
+        else
+            command -v "$target_cc" >/dev/null 2>&1 || { echo "Target compiler not found: $target_cc" >&2; exit 1; }
         fi
         local env_suffix="${rust_target//-/_}"
         local env_suffix_upper
@@ -299,7 +305,11 @@ build_target() {
         export "CARGO_TARGET_${env_suffix_upper}_LINKER=$target_cc"
         export "CC_${env_suffix}=$target_cc"
         if [[ -n "$target_ar" ]]; then
-            [[ -x "$target_ar" ]] || { echo "Target archiver not found: $target_ar" >&2; exit 1; }
+            if [[ "$target_ar" == */* ]]; then
+                [[ -x "$target_ar" ]] || { echo "Target archiver not found: $target_ar" >&2; exit 1; }
+            else
+                command -v "$target_ar" >/dev/null 2>&1 || { echo "Target archiver not found: $target_ar" >&2; exit 1; }
+            fi
             export "AR_${env_suffix}=$target_ar"
         fi
     fi
