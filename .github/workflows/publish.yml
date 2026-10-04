@@ -11,6 +11,8 @@ on:
       - "gradlew"
       - "gradlew.bat"
       - "lib/**"
+      - "demo/**"
+      - "benchmarks/**"
       - "settings.gradle.kts"
       - "scripts/**"
   push:
@@ -28,6 +30,8 @@ on:
       - "gradlew"
       - "gradlew.bat"
       - "lib/**"
+      - "demo/**"
+      - "benchmarks/**"
       - "settings.gradle.kts"
       - "scripts/**"
   workflow_dispatch:
@@ -43,7 +47,7 @@ on:
         type: boolean
 
 concurrency:
-  group: wasmtime-kmp-${{ github.ref }}-${{ inputs.version || github.run_id }}
+  group: wasmtime-kmp-${{ github.ref }}-${{ (github.event_name == 'workflow_dispatch' && inputs.publish && inputs.version) || 'ci' }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && !(github.event_name == 'workflow_dispatch' && inputs.publish) }}
 
 permissions:
