@@ -10,29 +10,35 @@ plugins {
 }
 
 val hostOs = System.getProperty("os.name").lowercase()
-check(hostOs.contains("linux")) { "The JVM demo currently supports Linux only: $hostOs" }
-val wasmtimeJvmNativeArch = when (System.getProperty("os.arch").lowercase()) {
-    "amd64", "x86_64" -> "linux-x64"
-    "aarch64", "arm64" -> "linux-arm64"
-    else -> error("Unsupported JVM Linux architecture: ${System.getProperty("os.arch")}")
-}
-val wasmtimeJvmNativeArchAttribute = Attribute.of(
-    "dev.brahmkshatriya.wasmtime.jvm.native.arch",
-    String::class.java,
-)
-val wasmtimeJvmNative = configurations.create("wasmtimeJvmNative") {
-    isCanBeConsumed = false
-    isCanBeResolved = true
-    attributes {
-        attribute(Category.CATEGORY_ATTRIBUTE, objects.named("wasmtime-jni"))
-        attribute(Usage.USAGE_ATTRIBUTE, objects.named(Usage.JAVA_RUNTIME))
-        attribute(LibraryElements.LIBRARY_ELEMENTS_ATTRIBUTE, objects.named(LibraryElements.JAR))
-        attribute(wasmtimeJvmNativeArchAttribute, wasmtimeJvmNativeArch)
+val isLinuxHost = hostOs.contains("linux")
+val wasmtimeJvmNative = if (isLinuxHost) {
+    val wasmtimeJvmNativeArch = when (System.getProperty("os.arch").lowercase()) {
+        "amd64", "x86_64" -> "linux-x64"
+        "aarch64", "arm64" -> "linux-arm64"
+        else -> error("Unsupported JVM Linux architecture: ${System.getProperty("os.arch")}")
     }
+    val wasmtimeJvmNativeArchAttribute = Attribute.of(
+        "dev.brahmkshatriya.wasmtime.jvm.native.arch",
+        String::class.java,
+    )
+    configurations.create("wasmtimeJvmNative") {
+        isCanBeConsumed = false
+        isCanBeResolved = true
+        attributes {
+            attribute(Category.CATEGORY_ATTRIBUTE, objects.named("wasmtime-jni"))
+            attribute(Usage.USAGE_ATTRIBUTE, objects.named(Usage.JAVA_RUNTIME))
+            attribute(LibraryElements.LIBRARY_ELEMENTS_ATTRIBUTE, objects.named(LibraryElements.JAR))
+            attribute(wasmtimeJvmNativeArchAttribute, wasmtimeJvmNativeArch)
+        }
+    }
+} else {
+    null
 }
 
-dependencies {
-    add(wasmtimeJvmNative.name, project(":lib"))
+if (wasmtimeJvmNative != null) {
+    dependencies {
+        add(wasmtimeJvmNative.name, project(":lib"))
+    }
 }
 
 kotlin {
@@ -41,7 +47,9 @@ kotlin {
     sourceSets.jvmMain.dependencies {
         implementation(projects.demo.client)
         implementation(compose.desktop.currentOs)
-        runtimeOnly(files(wasmtimeJvmNative))
+        if (wasmtimeJvmNative != null) {
+            runtimeOnly(files(wasmtimeJvmNative))
+        }
     }
 }
 
