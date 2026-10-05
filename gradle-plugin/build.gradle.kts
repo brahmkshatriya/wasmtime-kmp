@@ -7,9 +7,9 @@ plugins {
 }
 
 group = "dev.brahmkshatriya.wasmtime"
-version = providers.gradleProperty("wasmtimeVersion")
+version = providers.gradleProperty("VERSION")
     .orElse(providers.environmentVariable("WASMTIME_KMP_VERSION"))
-    .orElse("0.1.0-SNAPSHOT")
+    .orElse("unspecified")
     .get()
 
 dependencies {

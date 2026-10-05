@@ -13,7 +13,10 @@ plugins {
 }
 
 group = property("GROUP").toString()
-version = property("VERSION").toString()
+version = providers.gradleProperty("VERSION")
+    .orElse(providers.environmentVariable("WASMTIME_KMP_VERSION"))
+    .orElse("unspecified")
+    .get()
 
 val slimWasmtimeLinux = project.file("src/native/.deps/slim/x86_64-linux/lib/libwasmtime.a")
 val slimWasmtimeLinuxArm64 = project.file("src/native/.deps/slim/aarch64-linux/lib/libwasmtime.a")

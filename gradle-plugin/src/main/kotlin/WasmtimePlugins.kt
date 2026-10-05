@@ -29,7 +29,7 @@ import org.jetbrains.kotlin.gradle.plugin.KotlinPlatformType
 import javax.inject.Inject
 
 private val SDK_VERSION: String =
-    WasmtimeExtensionPlugin::class.java.`package`.implementationVersion ?: "0.1.0-SNAPSHOT"
+    WasmtimeExtensionPlugin::class.java.`package`.implementationVersion ?: "unspecified"
 private val GUEST_RUNTIME_COORDINATE: String
     get() = "dev.brahmkshatriya.wasmtime:guest-runtime:$SDK_VERSION"
 
