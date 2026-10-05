@@ -3,7 +3,6 @@ plugins {
 }
 
 group = property("GROUP").toString()
-version = property("VERSION").toString()
 
 wasmtimeExtension {
     outputFileName.set("benchmark-guest.wasm")
