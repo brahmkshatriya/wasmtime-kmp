@@ -1,7 +1,5 @@
 package dev.brahmkshatriya.wasmtime.demo
 
-import dev.brahmkshatriya.wasmtime.demo.shared.Plugin
-
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -28,9 +26,13 @@ fun DemoApp(storageRoot: String) {
     LaunchedEffect(selected, storageRoot) {
         state = UiState.Loading
         state = runCatching {
-            val plugin: Plugin = loadPlugin(selected, storageRoot)
-            val product = plugin.getProductDetails()
-            LoadedProduct(selected, product)
+            val loaded = loadPlugin(selected, storageRoot)
+            try {
+                val product = loaded.api.getProductDetails(if (selected.id == "plugin1") 1 else 2)
+                LoadedProduct(selected, product)
+            } finally {
+                loaded.shutdown()
+            }
         }.fold(
                 onSuccess = {
                     println("${it.plugin.name} -> ${it.product.id}: ${it.product.title}")
@@ -51,7 +53,7 @@ fun DemoApp(storageRoot: String) {
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
                 Text("Wasmtime KMP plugins", style = MaterialTheme.typography.headlineMedium)
-                Text("Plugins get sandboxed Ktor networking and persistent /data storage.")
+                Text("Plugins get host HTTP services and persistent /extension/persistent storage.")
 
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     demoPlugins.forEach { plugin ->

@@ -11,6 +11,7 @@ import org.jetbrains.kotlin.library.abi.AbiFunction
 import org.jetbrains.kotlin.library.abi.AbiType
 import org.jetbrains.kotlin.library.abi.AbiTypeArgument
 import org.jetbrains.kotlin.library.abi.AbiTypeNullability
+import org.jetbrains.kotlin.library.abi.AbiValueParameterKind
 import org.jetbrains.kotlin.library.abi.AbiVariance
 import org.jetbrains.kotlin.library.abi.LibraryAbiReader
 
@@ -27,7 +28,14 @@ public object WasmtimeContractAbiToolMain {
         require(args.size >= 2) { "usage: WasmtimeContractAbiToolMain <contract-fq-name> <klib>..." }
         val methods = readContract(args[0], args.drop(1).map(::File).toSet())
         methods.forEach { method ->
-            println("${method.methodId}\t${method.name}\t${method.returnType}")
+            println(
+                buildList {
+                    add(method.methodId.toString())
+                    add(method.name)
+                    add(method.returnType)
+                    addAll(method.parameterTypes)
+                }.joinToString("\t")
+            )
         }
     }
 }
@@ -35,6 +43,7 @@ public object WasmtimeContractAbiToolMain {
 private data class ToolMethod(
     val name: String,
     val returnType: String,
+    val parameterTypes: List<String>,
     val methodId: Int,
 )
 
@@ -62,17 +71,23 @@ private fun readContract(contractFqName: String, files: Set<File>): List<ToolMet
     require(functions.isNotEmpty()) {
         "Wasmtime extension contract has no callable methods: $contractFqName"
     }
-    val unsupported = functions.filter { !it.isSuspend || it.valueParameters.isNotEmpty() }
+    val unsupported = functions.filter { function ->
+        !function.isSuspend ||
+            function.valueParameters.any { it.kind == AbiValueParameterKind.EXTENSION_RECEIVER } ||
+            function.valueParameters.any { it.kind == AbiValueParameterKind.CONTEXT } ||
+            function.valueParameters.any { it.isVararg }
+    }
     require(unsupported.isEmpty()) {
         val names = unsupported.joinToString { it.qualifiedName.kotlinName() }
-        "Automatic Wasmtime contracts currently require zero-argument suspend methods; unsupported: $names"
+        "Automatic Wasmtime contracts require suspend member functions with ordinary value parameters; unsupported: $names"
     }
 
     val methods = functions.map { function ->
         val name = function.qualifiedName.toString().substringAfterLast('.')
         val returnType = function.returnType?.renderType() ?: "kotlin.Unit"
-        val signature = "$contractFqName#$name():$returnType"
-        ToolMethod(name, returnType, stableMethodId(signature))
+        val parameterTypes = function.valueParameters.map { it.type.renderType() }
+        val signature = "$contractFqName#$name(${parameterTypes.joinToString(",")}):$returnType"
+        ToolMethod(name, returnType, parameterTypes, stableMethodId(signature))
     }.sortedBy(ToolMethod::name)
 
     val collisions = methods.groupBy(ToolMethod::methodId).filterValues { it.size > 1 }

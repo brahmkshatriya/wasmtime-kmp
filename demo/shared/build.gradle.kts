@@ -40,8 +40,4 @@ kotlin {
         api(libs.kotlin.serialization.json)
     }
 
-    sourceSets.wasmWasiMain.dependencies {
-        api("dev.brahmkshatriya.ktorwasi:ktor-client-wasi:3.6.0")
-        api("org.jetbrains.kotlinx:kotlinx-io-core:0.9.1")
-    }
 }

@@ -3,21 +3,50 @@
 [![Maven Central](https://img.shields.io/maven-central/v/dev.brahmkshatriya.wasmtime/lib?label=Maven%20Central)](https://central.sonatype.com/artifact/dev.brahmkshatriya.wasmtime/lib)
 [![CI](https://github.com/brahmkshatriya/wasmtime-kmp/actions/workflows/publish.yml/badge.svg)](https://github.com/brahmkshatriya/wasmtime-kmp/actions/workflows/publish.yml)
 
-Run Kotlin/Wasm extensions inside Kotlin Multiplatform apps.
+Run WebAssembly from Kotlin Multiplatform using Wasmtime.
 
-`wasmtime-kmp` gives you:
+Use as much or as little of the library as you need:
 
-- a Kotlin API for loading and calling Wasm;
-- a Gradle plugin for building Kotlin/Wasm-WASI extensions;
-- a Gradle plugin for preparing the shared runtime used by those extensions;
-- generated Kotlin proxies, so your host app talks to an extension through a normal Kotlin interface;
-- optional HTTP and persistent-storage permissions that the host controls explicitly.
+- load arbitrary Wasm bytes and call exports directly;
+- generate a typed Kotlin proxy for Kotlin/Wasm extensions;
+- optionally let Gradle build and package extension projects for you;
+- optionally expose host services such as HTTP, storage, credentials, logging, and streams.
 
-The current release is shown by the Maven Central badge above. In the snippets below, replace `VERSION` with that value.
+Replace `VERSION` below with the version shown by the Maven Central badge.
+
+Make sure `mavenCentral()` is available in both `pluginManagement.repositories` and your normal dependency repositories.
+
+## Quick start: run arbitrary Wasm
+
+Add the runtime to `commonMain`:
+
+```kotlin
+kotlin {
+    sourceSets.commonMain.dependencies {
+        implementation("dev.brahmkshatriya.wasmtime:lib:VERSION")
+    }
+}
+```
+
+Then load any Wasm bytes you provide:
+
+```kotlin
+val instance = Wasmtime.load(wasmBytes)
+try {
+    val add = instance.functionI32("add")
+    println(add(20, 22))
+} finally {
+    instance.close()
+}
+```
+
+`wasmtime-kmp` does not require a particular resource format or packaging strategy. `wasmBytes` can come from app resources, disk, a download, a database, or anywhere else.
+
+Use `invokeAsync` / `callI32Async` when a Wasm call can wait on asynchronous host work.
 
 ## Supported hosts
 
-| Host | Available |
+| Host | Support |
 | --- | --- |
 | Android ARM64 / x86_64 | Yes |
 | Linux x64 / ARM64 | Yes |
@@ -27,77 +56,26 @@ The current release is shown by the Maven Central badge above. In the snippets b
 | JVM on Linux x64 / ARM64 | Yes |
 | Browser (Wasm/JS) | Yes |
 
-Extensions are built as Kotlin/Wasm-WASI modules.
+## Optional: typed Kotlin extensions
 
-## Add it to your project
+If both sides are Kotlin, you can describe the extension as a normal suspend interface and let the Gradle plugins generate the Wasm adapter and host proxy.
 
-The Gradle plugins and runtime are published to Maven Central.
-
-In `settings.gradle.kts`:
+### 1. Share a contract
 
 ```kotlin
-pluginManagement {
-    repositories {
-        mavenCentral()
-        gradlePluginPortal()
-    }
-}
-
-dependencyResolutionManagement {
-    repositories {
-        google()
-        mavenCentral()
-    }
-}
-```
-
-A host module applies the host plugin and depends on the runtime:
-
-```kotlin
-plugins {
-    kotlin("multiplatform")
-    id("dev.brahmkshatriya.wasmtime.host") version "VERSION"
-}
-
-kotlin {
-    sourceSets.commonMain.dependencies {
-        implementation("dev.brahmkshatriya.wasmtime:lib:VERSION")
-    }
-}
-```
-
-An extension module applies the extension plugin:
-
-```kotlin
-plugins {
-    id("dev.brahmkshatriya.wasmtime.extension") version "VERSION"
-}
-```
-
-Use the same `VERSION` for the library and both plugins.
-
-## 1. Define a shared Kotlin contract
-
-Create a small module that is used by both the host and the extension.
-
-```kotlin
-@Target(AnnotationTarget.CLASS)
-@Retention(AnnotationRetention.BINARY)
-annotation class ExtensionEntry
-
 interface Plugin {
-    suspend fun greeting(): Greeting
+    suspend fun greeting(name: String): Greeting
 }
 
 @kotlinx.serialization.Serializable
 data class Greeting(val message: String)
 ```
 
-The generated contract bridge currently supports public, zero-argument `suspend` functions returning `Unit` or a concrete serializable type.
+Contract parameters and return values should use concrete serializable types. `Unit` is supported.
 
-## 2. Build an extension
+### 2. Implement the extension
 
-Apply the extension plugin and tell it which shared API to use:
+Apply the extension plugin:
 
 ```kotlin
 plugins {
@@ -111,8 +89,9 @@ wasmtime {
 }
 
 wasmtimeExtension {
+    extensionId.set("example")
     contractInterface.set("com.example.Plugin")
-    entryPointAnnotation.set("com.example.ExtensionEntry")
+    implementationClass.set("com.example.MyPlugin")
 
     compileOnlyDependencies {
         useExtensionApi("pluginApi")
@@ -120,32 +99,29 @@ wasmtimeExtension {
 }
 ```
 
-Then implement the contract normally:
+Implement the interface normally:
 
 ```kotlin
-@ExtensionEntry
 object MyPlugin : Plugin {
-    override suspend fun greeting(): Greeting = Greeting("Hello from Wasm")
+    override suspend fun greeting(name: String) =
+        Greeting("Hello, $name from Wasm")
 }
 ```
 
-Build the final Wasm file with:
+Build the standalone extension with:
 
-```bash
+```shell
 ./gradlew :plugin:exportWasmtimeExtension
 ```
 
-The output is written to `plugin/build/wasmtime/`.
+The exported bundle is under `build/wasmtime/extension/` and contains `extension.wasm` plus its manifest. You are still free to package or distribute that output however you want.
 
-You only implement the Kotlin interface. The Gradle plugin generates the Wasm-facing glue code for you.
+### 3. Generate a host proxy
 
-## 3. Prepare the host
-
-Apply the host plugin in the module that will load the extension:
+Apply the host plugin:
 
 ```kotlin
 plugins {
-    kotlin("multiplatform")
     id("dev.brahmkshatriya.wasmtime.host") version "VERSION"
 }
 
@@ -162,96 +138,126 @@ wasmtimeHost {
         useExtensionApi("pluginApi")
     }
 }
+```
 
-kotlin {
-    sourceSets.commonMain.dependencies {
-        implementation("dev.brahmkshatriya.wasmtime:lib:VERSION")
-        implementation(project(":shared"))
+This generates `PluginWasmtimeProxy` and the shared Kotlin/Wasm runtime. It does not change how your app packages extension Wasm.
+
+## Optional: automatic extension packaging
+
+If you want Gradle to build an extension project and put it into your application resources, opt in explicitly:
+
+```kotlin
+wasmtimeHost {
+    contractInterface.set("com.example.Plugin")
+    bundleExtension(project(":plugin"))
+
+    runtimeDependencies {
+        useExtensionApi("pluginApi")
     }
 }
 ```
 
-Build the shared runtime with:
+`bundleExtension(...)` enables the convenience packaging layer. It generates `WasmtimeBundledExtensions` and wires the generated runtime/extension resources into KMP resources (and Compose resources when used).
 
-```bash
-./gradlew :host:buildWasmtimeRuntime
-```
+Without `bundleExtension(...)`:
 
-The task writes the shared runtime files under `host/build/wasmtime/runtime/`. The included `runtime.tsv` file tells the library which files to load and in what order.
+- `WasmtimeBundledExtensions` is not generated;
+- extension resource assembly tasks are not registered;
+- your app's resource packaging is untouched.
 
-Package that directory and the extension `.wasm` file with your app resources. The demo in this repository shows one way to do that for Compose Multiplatform.
-
-## 4. Load and call the extension
-
-The host plugin generates `PluginWasmtimeProxy` from the shared `Plugin` interface.
-
-Load the generated runtime manifest, create a transport, then use the generated proxy like a normal Kotlin object:
+Load a bundled extension like this:
 
 ```kotlin
-val runtime = loadWasmtimeRuntime(runtimeManifestText) { fileName ->
-    readRuntimeResource(fileName)
-}
-
-val transport = createWasmtimeExtensionTransport(
-    wasm = pluginWasmBytes,
-    runtime = runtime,
+val runtime = loadWasmtimeBundledRuntime(
+    manifestResourcePath = WasmtimeBundledExtensions.runtimeManifestResourcePath,
+    readResource = Res::readBytes,
 )
 
-val plugin: Plugin = PluginWasmtimeProxy(transport)
-val greeting = plugin.greeting()
+val loaded = WasmtimeBundledExtensions.example.load(
+    readResource = Res::readBytes,
+    runtime = runtime,
+    services = WasmtimeHostServices(),
+    expectedContract = PluginWasmtimeProxy.CONTRACT,
+    proxyFactory = ::PluginWasmtimeProxy,
+)
+
+try {
+    println(loaded.api.greeting("Ada").message)
+} finally {
+    loaded.shutdown()
+}
 ```
 
-If your extension does not need network or persistent storage, that is all you need to grant it.
+The bundled loader validates the manifest, API version, contract, and requested host capabilities before running the extension.
 
-## HTTP access
+## Host services
 
-Extensions do not get unrestricted network access. To allow HTTP, provide a `WasmtimeHttpHandler` and decide which requests are allowed:
+Typed extensions can request host capabilities. The host decides which services to provide through `WasmtimeHostServices`.
+
+| Service | Guest API | Typical use |
+| --- | --- | --- |
+| HTTP | `ExtensionHttp` | Make network requests through the host |
+| Credentials | `credential = "name"` | Let the host attach secrets without exposing them to guest code |
+| Storage | `ExtensionStorage` | Persistent, cache, and temporary extension data |
+| Logging | `ExtensionLog` | Structured extension logs |
+| Resources | `ExtensionResources` | Pull large host-owned data in bounded chunks |
+
+For example, grant HTTP on the host:
 
 ```kotlin
-val transport = createWasmtimeExtensionTransport(
-    wasm = pluginWasmBytes,
-    runtime = runtime,
-    httpHandler = WasmtimeHttpHandler { request ->
-        require(request.method == "GET")
-        require(request.url.startsWith("https://api.example.com/"))
-
-        val response = myHttpClient.get(request.url)
+val services = WasmtimeHostServices(
+    http = WasmtimeHttpHandler { request ->
         WasmtimeHttpResponse(
-            statusCode = response.status.value,
-            body = response.bodyAsBytes(),
+            statusCode = 200,
+            body = myHttp(request),
         )
     },
 )
 ```
 
-Treat this handler as a permission boundary. Validate the destination and redirect behavior before forwarding an extension request.
-
-Kotlin/Wasm extensions can use the published Ktor WASI client normally when you want a Ktor API inside the guest. The demo shows this setup.
-
-## Persistent storage
-
-Grant one directory to an extension with `WasmtimeStorage`:
+and use it in the extension:
 
 ```kotlin
-val storage = WasmtimeStorage(
-    backingPath = appDataDirectory,
-    guestPath = "/data",
-)
-
-val transport = createWasmtimeExtensionTransport(
-    wasm = pluginWasmBytes,
-    runtime = runtime,
-    storage = storage,
-)
+val response = ExtensionHttp.get("https://api.example.com/items")
 ```
 
-Inside the extension, `/data` behaves like its persistent directory. The extension does not get general access to the host filesystem.
+Storage is namespaced under `/extension`:
 
-Storage quotas can be changed with `maxBytes`, `maxEntries`, and `maxFileBytes`. Set a quota to `0` only when you intentionally want to disable that particular limit.
+```kotlin
+ExtensionStorage.prepare()
+val settings = ExtensionStorage.persistentPath("settings.json")
+val cache = ExtensionStorage.cachePath("feed.json")
+val temp = ExtensionStorage.temporaryPath("work.tmp")
+```
 
-## Resource limits
+Capabilities are declared by the extension, for example:
 
-`WasmtimeLimits` controls the main execution limits:
+```kotlin
+wasmtimeExtension {
+    capabilities("Http", "PersistentStorage", "Logging")
+}
+```
+
+Loading fails early when a required capability has not been provided by the host.
+
+## Lifecycle and errors
+
+Extensions can implement lifecycle hooks:
+
+```kotlin
+object MyPlugin : Plugin, WasmtimeExtensionLifecycle {
+    override suspend fun onLoad() = ExtensionStorage.prepare()
+    override suspend fun onUnload() = ExtensionLog.info("Closing")
+}
+```
+
+Guest exceptions are surfaced as `WasmtimeExtensionException` with the remote type, message, and guest stack information when available.
+
+Use `shutdown()` when you want the suspend `onUnload()` lifecycle to run. Use `close()` when you only need immediate transport cleanup.
+
+## Limits
+
+Use `WasmtimeLimits` to bound untrusted execution:
 
 ```kotlin
 val limits = WasmtimeLimits(
@@ -262,97 +268,43 @@ val limits = WasmtimeLimits(
 )
 ```
 
-Pass it when creating the extension transport:
+Limits can be used with bundled extensions, manually loaded extensions, and the lower-level runtime APIs.
+
+## Testing extensions
+
+`withWasmtimeExtension(...)` owns the transport lifecycle and lets tests provide fake host services:
 
 ```kotlin
-val transport = createWasmtimeExtensionTransport(
-    wasm = pluginWasmBytes,
+withWasmtimeExtension(
+    wasm = extensionBytes,
     runtime = runtime,
-    limits = limits,
-)
-```
-
-The defaults are intended for plugin-style workloads. Tighten them for your application when you know the expected workload.
-
-## Loading plain Wasm without the extension plugins
-
-You can use the runtime directly for a simple Wasm module:
-
-```kotlin
-val instance = Wasmtime.load(wasmBytes)
-try {
-    val add = instance.functionI32("add")
-    val result = add(20, 22)
-} finally {
-    instance.close()
+    services = testServices,
+    proxyFactory = ::PluginWasmtimeProxy,
+) { plugin ->
+    check(plugin.greeting("test").message.isNotBlank())
 }
 ```
 
-`functionI32` resolves an exported `(i32, i32) -> i32` function once so it can be reused efficiently.
-
-Use `invokeAsync` / `callI32Async` when the Wasm call can wait on an asynchronous host capability.
-
 ## JVM on Linux
 
-On JVM/Linux, add the normal API JAR plus one small native runtime JAR for the machine that will run your app:
+JVM/Linux needs the API JAR plus the native runtime for the machine running the app:
 
 ```kotlin
 implementation("dev.brahmkshatriya.wasmtime:lib-jvm:VERSION")
 runtimeOnly("dev.brahmkshatriya.wasmtime:lib-jvm:VERSION:linux-x64")
 ```
 
-For Linux ARM64, use the `linux-arm64` classifier instead.
+Use the `linux-arm64` classifier on ARM64. Kotlin/Native targets do not need this extra runtime dependency.
 
-Kotlin Multiplatform native targets do not need this extra classifier.
+## Demo
 
-## Example project
+The `demo` directory contains real extension/host examples for Android, Linux, JVM, and the browser. It explicitly uses `bundleExtension(...)` to demonstrate the optional automatic-packaging path.
 
-The `demo` directory contains two real Kotlin/Wasm extensions and host apps for Android, Linux, JVM, and the browser.
-
-Useful commands:
-
-```bash
-# Build both extensions and the shared runtime
-./gradlew \
-  :demo:plugin1:exportWasmtimeExtension \
-  :demo:plugin2:exportWasmtimeExtension \
-  :demo:client:buildWasmtimeRuntime
-
-# Linux app
-./gradlew :demo:apps:linux:linkReleaseExecutableLinuxX64
-
-# JVM app
-./gradlew :demo:apps:jvm:run
-
-# Browser app
-./gradlew :demo:apps:web:wasmJsBrowserDevelopmentRun
+```shell
+./gradlew :demo:apps:linux:linkDebugExecutableLinuxX64
+./demo/apps/linux/build/bin/linuxX64/debugExecutable/wasmtime-kmp-demo.kexe --smoke-extension
 ```
-
-The demo also shows:
-
-- Ktor HTTP from inside a Wasm/WASI extension;
-- host-side URL filtering;
-- per-extension persistent storage;
-- packaging the generated runtime and extension Wasm files as app resources.
-
-## Building this repository
-
-Use JDK 21.
-
-The normal verification entry points are Gradle tasks in this repository. Platform-specific native artifacts are built on matching CI runners before the Maven repository is merged and checked.
-
-The project version is not stored in source. For a local publication, provide it explicitly:
-
-```bash
-export VERSION=your-version
-export WASMTIME_KMP_VERSION="$VERSION"
-export WASMTIME_MAVEN_REPOSITORY="$PWD/release/maven-repository"
-
-./gradlew -PVERSION="$VERSION" publishWasmtimeCommonToMavenRepository
-```
-
-A Git tag named `v<version>` is the release source of truth in CI. The tag build creates and verifies the complete Maven repository before uploading that exact repository to Maven Central.
 
 ## License
 
-Apache License 2.0.
+See [LICENSE](LICENSE).

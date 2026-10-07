@@ -10,11 +10,13 @@ import org.gradle.api.GradleException
 import org.gradle.api.file.ConfigurableFileCollection
 import org.gradle.api.file.DirectoryProperty
 import org.gradle.api.file.RegularFileProperty
+import org.gradle.api.provider.ListProperty
 import org.gradle.api.provider.Property
 import org.gradle.api.tasks.Classpath
 import org.gradle.api.tasks.Input
 import org.gradle.api.tasks.InputDirectory
 import org.gradle.api.tasks.InputFile
+import org.gradle.api.tasks.InputFiles
 import org.gradle.api.tasks.OutputDirectory
 import org.gradle.api.tasks.OutputFile
 import org.gradle.api.tasks.PathSensitive
@@ -166,6 +168,27 @@ abstract class ExportWasmtimeExtensionTask @Inject constructor(
     @get:OutputFile
     abstract val outputWasm: RegularFileProperty
 
+    @get:Input
+    abstract val extensionId: Property<String>
+
+    @get:Input
+    abstract val extensionName: Property<String>
+
+    @get:Input
+    abstract val extensionVersion: Property<String>
+
+    @get:Input
+    abstract val apiVersion: Property<Int>
+
+    @get:Input
+    abstract val contractInterface: Property<String>
+
+    @get:Input
+    abstract val capabilities: ListProperty<String>
+
+    @get:OutputFile
+    abstract val outputManifest: RegularFileProperty
+
     @TaskAction
     fun export() {
         val klib = extensionKlib.get().asFile
@@ -213,6 +236,175 @@ abstract class ExportWasmtimeExtensionTask @Inject constructor(
         val stripped = File(temporaryDir, "stripped.wasm")
         stripWasmMetadata(linked, stripped)
         runTypePruner(typePruner.get().asFile, stripped, outputWasm.get().asFile)
+
+        val manifest = outputManifest.get().asFile
+        manifest.parentFile.mkdirs()
+        manifest.writeText(
+            buildString {
+                appendLine("id=${extensionId.get()}")
+                appendLine("name=${extensionName.get()}")
+                appendLine("version=${extensionVersion.get()}")
+                appendLine("apiVersion=${apiVersion.get()}")
+                appendLine("contract=${contractInterface.get()}")
+                appendLine("capabilities=${capabilities.get().distinct().sorted().joinToString(",")}")
+            }
+        )
+    }
+}
+
+
+/** Assembles the host runtime and resolved extension bundles into generated application resources. */
+abstract class AssembleWasmtimeHostResourcesTask : DefaultTask() {
+    @get:InputDirectory
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val runtimeDirectory: DirectoryProperty
+
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val extensionBundles: ConfigurableFileCollection
+
+    @get:OutputDirectory
+    abstract val outputDirectory: DirectoryProperty
+
+    @TaskAction
+    fun assemble() {
+        val output = outputDirectory.get().asFile.apply {
+            deleteRecursively()
+            mkdirs()
+        }
+        val filesRoot = File(output, "files/wasmtime").apply { mkdirs() }
+        val runtimeOutput = File(filesRoot, "runtime")
+        check(runtimeDirectory.get().asFile.copyRecursively(runtimeOutput, overwrite = true)) {
+            "Failed to copy generated Wasmtime runtime resources"
+        }
+
+        val extensionsRoot = File(filesRoot, "extensions").apply { mkdirs() }
+        val seenIds = linkedSetOf<String>()
+        val index = mutableListOf<String>()
+        extensionBundles.files.sortedBy(File::getAbsolutePath).forEach { bundle ->
+            val manifest = File(bundle, "extension.properties")
+            val wasm = File(bundle, "extension.wasm")
+            if (!manifest.isFile || !wasm.isFile) {
+                throw GradleException(
+                    "Invalid Wasmtime extension artifact $bundle; expected extension.properties and extension.wasm"
+                )
+            }
+            val properties = Properties().apply { manifest.inputStream().use(::load) }
+            val id = properties.getProperty("id")?.trim().orEmpty()
+            if (!id.matches(Regex("[A-Za-z0-9._-]+"))) {
+                throw GradleException("Invalid Wasmtime extension id '$id' in $manifest")
+            }
+            if (!seenIds.add(id)) throw GradleException("Duplicate Wasmtime extension id '$id'")
+
+            val target = File(extensionsRoot, id).apply { mkdirs() }
+            wasm.copyTo(File(target, "extension.wasm"), overwrite = true)
+            manifest.copyTo(File(target, "extension.properties"), overwrite = true)
+            index += listOf(
+                id,
+                "files/wasmtime/extensions/$id/extension.wasm",
+                "files/wasmtime/extensions/$id/extension.properties",
+            ).joinToString("\t")
+        }
+        File(filesRoot, "extensions.tsv").writeText(
+            index.joinToString("\n", postfix = if (index.isEmpty()) "" else "\n")
+        )
+    }
+}
+
+
+/** Generates strongly typed descriptors for extension artifacts resolved by the host. */
+abstract class GenerateWasmtimeArtifactsSourceTask : DefaultTask() {
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val extensionBundles: ConfigurableFileCollection
+
+    @get:OutputDirectory
+    abstract val outputDirectory: DirectoryProperty
+
+    @TaskAction
+    fun generate() {
+        val descriptors = extensionBundles.files.sortedBy(File::getAbsolutePath).map { bundle ->
+            val manifest = File(bundle, "extension.properties")
+            if (!manifest.isFile) throw GradleException("Invalid Wasmtime extension artifact $bundle")
+            val properties = Properties().apply { manifest.inputStream().use(::load) }
+            arrayOf(
+                properties.getProperty("id")?.trim().orEmpty(),
+                properties.getProperty("name")?.trim().orEmpty(),
+                properties.getProperty("version")?.trim().orEmpty(),
+                properties.getProperty("contract")?.trim().orEmpty(),
+                properties.getProperty("apiVersion")?.trim().orEmpty(),
+            )
+        }
+        val duplicateIds = descriptors.groupBy { it[0] }.filterValues { it.size > 1 }
+        if (duplicateIds.isNotEmpty()) throw GradleException("Duplicate Wasmtime extension ids: ${duplicateIds.keys}")
+
+        fun quote(value: String): String = buildString {
+            append('"')
+            value.forEach { char ->
+                when (char) {
+                    '\\' -> append("\\\\")
+                    '"' -> append("\\\"")
+                    '\n' -> append("\\n")
+                    '\r' -> append("\\r")
+                    '\t' -> append("\\t")
+                    else -> append(char)
+                }
+            }
+            append('"')
+        }
+        fun identifier(id: String): String {
+            val pieces = id.split(Regex("[^A-Za-z0-9]+"))
+                .filter(String::isNotBlank)
+            val raw = pieces.mapIndexed { index, piece ->
+                if (index == 0) piece.replaceFirstChar(Char::lowercaseChar)
+                else piece.replaceFirstChar(Char::uppercaseChar)
+            }.joinToString("").ifBlank { "extension" }
+            return if (raw.firstOrNull()?.isDigit() == true) "extension$raw" else raw
+        }
+
+        val entries = descriptors.joinToString(",\n") { fields ->
+            val apiVersion = fields[4].toIntOrNull()
+                ?: throw GradleException("Invalid apiVersion for extension '${fields[0]}'")
+            val id = fields[0]
+            """        WasmtimeBundledExtension(
+            id = ${quote(id)},
+            name = ${quote(fields[1])},
+            version = ${quote(fields[2])},
+            apiVersion = $apiVersion,
+            contract = ${quote(fields[3])},
+            wasmResourcePath = ${quote("files/wasmtime/extensions/$id/extension.wasm")},
+            manifestResourcePath = ${quote("files/wasmtime/extensions/$id/extension.properties")},
+        )"""
+        }
+        val named = descriptors.joinToString("\n") { fields ->
+            "    public val ${identifier(fields[0])}: WasmtimeBundledExtension get() = get(${quote(fields[0])})"
+        }
+
+        val output = outputDirectory.file(
+            "dev/brahmkshatriya/wasmtime/generated/WasmtimeBundledExtensions.kt"
+        ).get().asFile
+        output.parentFile.mkdirs()
+        output.writeText(
+            """
+            package dev.brahmkshatriya.wasmtime.generated
+
+            import dev.brahmkshatriya.wasmtime.WasmtimeBundledExtension
+
+            public object WasmtimeBundledExtensions {
+                public const val runtimeManifestResourcePath: String = "files/wasmtime/runtime/runtime.tsv"
+                public const val extensionIndexResourcePath: String = "files/wasmtime/extensions.tsv"
+
+                public val all: List<WasmtimeBundledExtension> = listOf(
+            $entries
+                )
+
+                public fun get(id: String): WasmtimeBundledExtension =
+                    all.firstOrNull { it.id == id } ?: error("Unknown bundled Wasmtime extension: ${'$'}id")
+
+            $named
+            }
+            """.trimIndent() + "\n"
+        )
     }
 }
 

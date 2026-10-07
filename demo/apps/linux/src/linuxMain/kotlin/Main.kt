@@ -8,6 +8,7 @@ import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
 import kotlinx.cinterop.toKString
+import kotlinx.coroutines.runBlocking
 import platform.posix.getenv
 
 private fun storageRoot(): String {
@@ -17,12 +18,18 @@ private fun storageRoot(): String {
     return "$home/.local/share/wasmtime-kmp-demo/plugins"
 }
 
-fun main() = application {
-    Window(
-        onCloseRequest = ::exitApplication,
-        title = "Wasmtime KMP",
-        state = rememberWindowState(size = DpSize(640.dp, 360.dp)),
-    ) {
-        DemoApp(storageRoot())
+fun main(args: Array<String>) {
+    if ("--smoke-extension" in args) {
+        runBlocking { runDemoExtensionSmoke(storageRoot()) }
+        return
+    }
+    application {
+        Window(
+            onCloseRequest = ::exitApplication,
+            title = "Wasmtime KMP",
+            state = rememberWindowState(size = DpSize(640.dp, 360.dp)),
+        ) {
+            DemoApp(storageRoot())
+        }
     }
 }

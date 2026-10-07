@@ -10,16 +10,15 @@ import org.gradle.api.file.DirectoryProperty
 import org.gradle.api.provider.Property
 import org.gradle.api.tasks.Classpath
 import org.gradle.api.tasks.Input
-import org.gradle.api.tasks.InputFiles
 import org.gradle.api.tasks.Optional
 import org.gradle.api.tasks.OutputDirectory
 import org.gradle.api.tasks.PathSensitive
 import org.gradle.api.tasks.PathSensitivity
 import org.gradle.api.tasks.TaskAction
 import org.gradle.process.ExecOperations
-import org.jetbrains.kotlin.lexer.KotlinLexer
-import org.jetbrains.kotlin.lexer.KtTokens
 
+private const val ABI_ARGUMENT_PREPARE = "__wasmtime_extension_argument_prepare"
+private const val ABI_ARGUMENT_BYTE = "__wasmtime_extension_argument_byte"
 private const val ABI_START = "__wasmtime_extension_start"
 private const val ABI_POLL = "__wasmtime_extension_poll"
 private const val ABI_NEXT_WAKE = "__wasmtime_extension_next_wake_millis"
@@ -32,24 +31,19 @@ private const val ABI_ERROR_BYTE = "__wasmtime_extension_error_byte"
 private data class ContractMethod(
     val name: String,
     val returnType: String,
+    val parameterTypes: List<String>,
     val methodId: Int,
 )
-
-private data class SourceToken(val type: Any, val text: String)
 
 /**
  * Generates the guest-side adapter that binds a configured contract interface to the annotated implementation.
  *
  * Registered automatically by [WasmtimeExtensionPlugin]; extension authors configure
- * [WasmtimeExtensionSettings.contractInterface] and [WasmtimeExtensionSettings.entryPointAnnotation] instead.
+ * [WasmtimeExtensionSettings.contractInterface] and [WasmtimeExtensionSettings.implementationClass] instead.
  */
 abstract class GenerateWasmtimeExtensionAdapterTask @Inject constructor(
     private val execOperations: ExecOperations,
 ) : DefaultTask() {
-    @get:InputFiles
-    @get:PathSensitive(PathSensitivity.RELATIVE)
-    abstract val kotlinSources: ConfigurableFileCollection
-
     @get:Classpath
     abstract val apiKlibs: ConfigurableFileCollection
 
@@ -58,7 +52,7 @@ abstract class GenerateWasmtimeExtensionAdapterTask @Inject constructor(
 
     @get:Input
     @get:Optional
-    abstract val entryPointAnnotation: Property<String>
+    abstract val implementationClass: Property<String>
 
     @get:Input
     @get:Optional
@@ -69,30 +63,14 @@ abstract class GenerateWasmtimeExtensionAdapterTask @Inject constructor(
 
     @TaskAction
     fun generate() {
-        val annotation = entryPointAnnotation.orNull ?: return clearOutput()
+        val implementation = implementationClass.orNull ?: return clearOutput()
         val contract = contractInterface.orNull ?: return clearOutput()
-        val entryPoint = discoverAnnotatedObject(annotation)
         val methods = readContractIsolated(contract, apiKlibs.files, toolClasspath, execOperations)
-        writeGuestAdapter(entryPoint, contract, methods)
+        writeGuestAdapter(implementation, contract, methods)
     }
 
     private fun clearOutput() {
         outputDirectory.get().asFile.deleteRecursively()
-    }
-
-    private fun discoverAnnotatedObject(annotationFqName: String): String {
-        val candidates = kotlinSources.files
-            .asSequence()
-            .filter { it.isFile && it.extension == "kt" }
-            .flatMap { source -> findAnnotatedObjects(source.readText(), annotationFqName).asSequence() }
-            .distinct()
-            .toList()
-        if (candidates.size != 1) {
-            throw GradleException(
-                "Expected exactly one @$annotationFqName top-level object, found ${candidates.size}: $candidates"
-            )
-        }
-        return candidates.single()
     }
 
     private fun writeGuestAdapter(
@@ -101,14 +79,18 @@ abstract class GenerateWasmtimeExtensionAdapterTask @Inject constructor(
         methods: List<ContractMethod>,
     ) {
         val branches = methods.joinToString("\n") { method ->
+            val arguments = method.parameterTypes.mapIndexed { index, type ->
+                "json.decodeFromJsonElement<$type>(arguments[$index])"
+            }.joinToString(", ")
+            val callExpression = "implementation.${method.name}($arguments)"
             if (method.returnType == "kotlin.Unit") {
                 """                ${method.methodId} -> {
-                    implementation.${method.name}()
+                    $callExpression
                     ByteArray(0)
                 }"""
             } else {
                 """                ${method.methodId} -> json.encodeToString<${method.returnType}>(
-                    implementation.${method.name}()
+                    $callExpression
                 ).encodeToByteArray()"""
             }
         }
@@ -121,19 +103,58 @@ abstract class GenerateWasmtimeExtensionAdapterTask @Inject constructor(
             package dev.brahmkshatriya.wasmtime.generated
 
             import dev.brahmkshatriya.wasmtime.extension.WasmtimeExtensionCall
+            import dev.brahmkshatriya.wasmtime.extension.WasmtimeExtensionExecution
+            import dev.brahmkshatriya.wasmtime.extension.WasmtimeExtensionLifecycle
+            import kotlinx.coroutines.CancellationException
             import kotlinx.serialization.encodeToString
             import kotlinx.serialization.json.Json
+            import kotlinx.serialization.json.decodeFromJsonElement
+            import kotlinx.serialization.json.jsonArray
             import kotlin.wasm.ExperimentalWasmInterop
             import kotlin.wasm.WasmExport
 
             private val implementation: $contract = $entryPoint
             private val json = Json { ignoreUnknownKeys = true }
-            private val call = WasmtimeExtensionCall { methodId ->
-                when (methodId) {
+            private val call = WasmtimeExtensionCall { methodId, argumentBytes ->
+                val arguments = if (argumentBytes.isEmpty()) {
+                    emptyList()
+                } else {
+                    json.parseToJsonElement(argumentBytes.decodeToString()).jsonArray
+                }
+                try {
+                    val result = when (methodId) {
+                    -2147483648 -> {
+                        (implementation as? WasmtimeExtensionLifecycle)?.onLoad()
+                        ByteArray(0)
+                    }
+                    -2147483647 -> {
+                        (implementation as? WasmtimeExtensionLifecycle)?.onUnload()
+                        ByteArray(0)
+                    }
             $branches
                     else -> error("unknown extension method id: ${'$'}methodId")
+                    }
+                    WasmtimeExtensionExecution.success(result)
+                } catch (cause: CancellationException) {
+                    WasmtimeExtensionExecution.cancelled(
+                        type = cause::class.simpleName ?: "CancellationException",
+                        message = cause.message ?: "extension call cancelled",
+                    )
+                } catch (cause: Throwable) {
+                    WasmtimeExtensionExecution.failure(
+                        type = cause::class.simpleName ?: "Throwable",
+                        message = cause.message ?: "extension call failed",
+                    )
                 }
             }
+
+            @OptIn(ExperimentalWasmInterop::class)
+            @WasmExport("$ABI_ARGUMENT_PREPARE")
+            fun wasmtimeExtensionArgumentPrepare(length: Int, unused: Int): Int = call.prepareArguments(length)
+
+            @OptIn(ExperimentalWasmInterop::class)
+            @WasmExport("$ABI_ARGUMENT_BYTE")
+            fun wasmtimeExtensionArgumentByte(index: Int, value: Int): Int = call.setArgumentByte(index, value)
 
             @OptIn(ExperimentalWasmInterop::class)
             @WasmExport("$ABI_START")
@@ -171,6 +192,7 @@ abstract class GenerateWasmtimeExtensionAdapterTask @Inject constructor(
             """.trimIndent() + "\n"
         )
     }
+
 }
 
 /**
@@ -210,13 +232,26 @@ abstract class GenerateWasmtimeHostProxyTask @Inject constructor(
         val simpleName = contract.substringAfterLast('.')
         val className = "${simpleName}WasmtimeProxy"
         val overrides = methods.joinToString("\n\n") { method ->
+            val parameters = method.parameterTypes.mapIndexed { index, type -> "p$index: $type" }.joinToString(", ")
+            val payload = if (method.parameterTypes.isEmpty()) {
+                "ByteArray(0)"
+            } else {
+                val elements = method.parameterTypes.mapIndexed { index, type ->
+                    "add(json.encodeToJsonElement<$type>(p$index))"
+                }.joinToString("\n            ")
+                """buildJsonArray {
+            $elements
+        }.toString().encodeToByteArray()"""
+            }
             if (method.returnType == "kotlin.Unit") {
-                """    override suspend fun ${method.name}(): kotlin.Unit {
-        transport.invoke(${method.methodId})
+                """    override suspend fun ${method.name}($parameters): kotlin.Unit {
+        val arguments = $payload
+        transport.invoke(${method.methodId}, arguments)
     }"""
             } else {
-                """    override suspend fun ${method.name}(): ${method.returnType} {
-        val bytes = transport.invoke(${method.methodId})
+                """    override suspend fun ${method.name}($parameters): ${method.returnType} {
+        val arguments = $payload
+        val bytes = transport.invoke(${method.methodId}, arguments)
         return json.decodeFromString<${method.returnType}>(bytes.decodeToString())
     }"""
             }
@@ -232,96 +267,24 @@ abstract class GenerateWasmtimeHostProxyTask @Inject constructor(
             import dev.brahmkshatriya.wasmtime.WasmtimeExtensionTransport
             import kotlinx.serialization.decodeFromString
             import kotlinx.serialization.json.Json
+            import kotlinx.serialization.json.buildJsonArray
+            import kotlinx.serialization.json.encodeToJsonElement
 
-            /**
-             * Generated host-side implementation of [$contract].
-             *
-             * Create [transport] with `createWasmtimeExtensionTransport(...)`; this proxy handles stable method
-             * IDs and JSON serialization for the contract methods.
-             */
+            @Suppress("PARAMETER_NAME_CHANGED_ON_OVERRIDE")
             public class $className(
                 private val transport: WasmtimeExtensionTransport,
                 private val json: Json = Json { ignoreUnknownKeys = true },
             ) : $contract {
             $overrides
+
+                public companion object {
+                    public const val CONTRACT: String = "$contract"
+                }
             }
             """.trimIndent() + "\n"
         )
     }
-}
 
-private fun findAnnotatedObjects(source: String, annotationFqName: String): List<String> {
-    val packageName = Regex("(?m)^\\s*package\\s+([A-Za-z_][A-Za-z0-9_.]*)")
-        .find(source)?.groupValues?.get(1).orEmpty()
-    val imports = Regex(
-        "(?m)^\\s*import\\s+([A-Za-z_][A-Za-z0-9_.]*)(?:\\s+as\\s+([A-Za-z_][A-Za-z0-9_]*))?\\s*$"
-    ).findAll(source).associate { match ->
-        val fqName = match.groupValues[1]
-        val alias = match.groupValues[2].ifBlank { fqName.substringAfterLast('.') }
-        alias to fqName
-    }
-
-    val lexer = KotlinLexer()
-    lexer.start(source)
-    val tokens = buildList {
-        while (lexer.tokenType != null) {
-            val type = lexer.tokenType!!
-            if (type != KtTokens.WHITE_SPACE &&
-                type != KtTokens.EOL_COMMENT &&
-                type != KtTokens.BLOCK_COMMENT
-            ) add(SourceToken(type, lexer.tokenText.orEmpty()))
-            lexer.advance()
-        }
-    }
-
-    fun annotationMatches(raw: String): Boolean =
-        raw == annotationFqName ||
-            imports[raw] == annotationFqName ||
-            (raw == annotationFqName.substringAfterLast('.') &&
-                packageName == annotationFqName.substringBeforeLast('.'))
-
-    val result = mutableListOf<String>()
-    var depth = 0
-    var pendingEntry = false
-    var index = 0
-    while (index < tokens.size) {
-        val token = tokens[index]
-        when (token.type) {
-            KtTokens.LBRACE -> depth++
-            KtTokens.RBRACE -> depth--
-            KtTokens.AT -> if (depth == 0) {
-                var cursor = index + 1
-                val name = StringBuilder()
-                while (cursor < tokens.size) {
-                    val next = tokens[cursor]
-                    if (next.type == KtTokens.IDENTIFIER || next.type == KtTokens.DOT) {
-                        name.append(next.text)
-                        cursor++
-                    } else break
-                }
-                if (annotationMatches(name.toString())) pendingEntry = true
-                index = cursor - 1
-            }
-            KtTokens.OBJECT_KEYWORD -> if (depth == 0) {
-                if (pendingEntry) {
-                    val name = tokens.drop(index + 1)
-                        .firstOrNull { it.type == KtTokens.IDENTIFIER }
-                        ?.text
-                        ?: throw GradleException("@$annotationFqName object must have a name")
-                    result += if (packageName.isBlank()) name else "$packageName.$name"
-                }
-                pendingEntry = false
-            }
-            KtTokens.CLASS_KEYWORD,
-            KtTokens.INTERFACE_KEYWORD,
-            KtTokens.FUN_KEYWORD,
-            KtTokens.VAL_KEYWORD,
-            KtTokens.VAR_KEYWORD,
-            KtTokens.TYPE_ALIAS_KEYWORD -> if (depth == 0) pendingEntry = false
-        }
-        index++
-    }
-    return result
 }
 
 private fun readContractIsolated(
@@ -347,9 +310,14 @@ private fun readContractIsolated(
         .lineSequence()
         .filter(String::isNotBlank)
         .map { line ->
-            val parts = line.split('\t', limit = 3)
-            if (parts.size != 3) throw GradleException("Invalid Wasmtime contract ABI tool output: $line")
-            ContractMethod(parts[1], parts[2], parts[0].toInt())
+            val parts = line.split('\t')
+            if (parts.size < 3) throw GradleException("Invalid Wasmtime contract ABI tool output: $line")
+            ContractMethod(
+                name = parts[1],
+                returnType = parts[2],
+                parameterTypes = parts.drop(3),
+                methodId = parts[0].toInt(),
+            )
         }
         .toList()
 }

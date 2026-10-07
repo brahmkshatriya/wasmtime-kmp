@@ -19,9 +19,6 @@ android {
     sourceSets.getByName("main").jniLibs.srcDir(
         project(":lib").layout.buildDirectory.dir("generated/jniLibs").get().asFile
     )
-    sourceSets.getByName("main").assets.srcDir(
-        project(":demo:client").layout.buildDirectory.dir("generated/compose/androidAssets").get().asFile
-    )
 }
 
 dependencies {
@@ -32,5 +29,4 @@ dependencies {
 
 tasks.named("preBuild").configure {
     dependsOn(":lib:buildAndroidNativeBridge")
-    dependsOn(":demo:client:prepareAndroidComposeAssets")
 }

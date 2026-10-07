@@ -16,6 +16,8 @@ wasmtime {
 
 wasmtimeHost {
     contractInterface.set("dev.brahmkshatriya.wasmtime.demo.shared.Plugin")
+    bundleExtension(projects.demo.plugin1)
+    bundleExtension(projects.demo.plugin2)
     runtimeDependencies {
         useExtensionApi("demo")
     }
@@ -37,6 +39,7 @@ kotlin {
     @OptIn(org.jetbrains.kotlin.gradle.ExperimentalWasmDsl::class)
     wasmJs {
         browser()
+        binaries.executable()
     }
 
     sourceSets {
@@ -72,54 +75,8 @@ kotlin {
     }
 }
 
-
-val plugin1Wasm = project(":demo:plugin1").layout.buildDirectory.file("wasmtime/plugin1.wasm")
-val plugin2Wasm = project(":demo:plugin2").layout.buildDirectory.file("wasmtime/plugin2.wasm")
-val wasmRuntimeBundle = layout.buildDirectory.dir("wasmtime/runtime")
-
-val syncDemoPluginResources = tasks.register("syncDemoPluginResources") {
-    dependsOn(":demo:plugin1:exportWasmtimeExtension")
-    dependsOn(":demo:plugin2:exportWasmtimeExtension")
-    dependsOn("buildWasmtimeRuntime")
-    inputs.files(plugin1Wasm, plugin2Wasm)
-    inputs.dir(wasmRuntimeBundle)
-    val output = layout.projectDirectory.dir("src/commonMain/composeResources/files")
-    outputs.files(output.file("plugin1.wasm"), output.file("plugin2.wasm"))
-    outputs.dir(output.dir("runtime"))
-
-    doLast {
-        val directory = output.asFile
-        plugin1Wasm.get().asFile.copyTo(directory.resolve("plugin1.wasm"), overwrite = true)
-        plugin2Wasm.get().asFile.copyTo(directory.resolve("plugin2.wasm"), overwrite = true)
-        val runtimeOutput = directory.resolve("runtime")
-        runtimeOutput.deleteRecursively()
-        check(wasmRuntimeBundle.get().asFile.copyRecursively(runtimeOutput, overwrite = true)) {
-            "Failed to copy Wasm runtime bundle"
-        }
-    }
-}
-
-val androidComposeAssets = layout.buildDirectory.dir("generated/compose/androidAssets")
-
-val prepareAndroidComposeAssets = tasks.register<Sync>("prepareAndroidComposeAssets") {
-    dependsOn(syncDemoPluginResources)
-    from(layout.projectDirectory.dir("src/commonMain/composeResources"))
-    into(
-        androidComposeAssets.map {
-            it.dir("composeResources/dev.brahmkshatriya.wasmtime.demo.generated.resources")
-        }
-    )
-}
-
 compose.resources {
     publicResClass = true
     packageOfResClass = "dev.brahmkshatriya.wasmtime.demo.generated.resources"
     generateResClass = always
-}
-
-tasks.matching {
-    it.name == "prepareComposeResourcesTaskForCommonMain" ||
-        it.name == "copyNonXmlValueResourcesForCommonMain"
-}.configureEach {
-    dependsOn(syncDemoPluginResources)
 }

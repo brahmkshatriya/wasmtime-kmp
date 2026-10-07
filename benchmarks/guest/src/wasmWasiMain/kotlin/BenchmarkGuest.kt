@@ -3,6 +3,7 @@
 package dev.brahmkshatriya.wasmtime.benchmark
 
 import dev.brahmkshatriya.wasmtime.extension.WasmtimeExtensionCall
+import dev.brahmkshatriya.wasmtime.extension.WasmtimeExtensionExecution
 import io.ktor.client.HttpClient
 import io.ktor.client.request.HttpRequestPipeline
 import io.ktor.client.request.get
@@ -58,7 +59,7 @@ private var asyncKind = 0
 private var asyncCount = 0
 private var asyncResult = 0
 
-private val asyncCall = WasmtimeExtensionCall { _: Int ->
+private val asyncCall = WasmtimeExtensionCall { _: Int, _: ByteArray ->
     asyncResult = when (asyncKind) {
         OP_YIELD -> {
             repeat(asyncCount) { yield() }
@@ -111,7 +112,7 @@ private val asyncCall = WasmtimeExtensionCall { _: Int ->
         }
         else -> error("unknown benchmark operation: $asyncKind")
     }
-    byteArrayOf(1)
+    WasmtimeExtensionExecution.success(byteArrayOf(1))
 }
 
 @WasmExport("bench_compute")
@@ -145,7 +146,7 @@ fun benchAsyncStart(kind: Int, count: Int): Int {
     asyncKind = kind
     asyncCount = count
     asyncResult = 0
-    return asyncCall.start()
+    return asyncCall.start(0)
 }
 
 @WasmExport("bench_async_poll")

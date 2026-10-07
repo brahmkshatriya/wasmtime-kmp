@@ -16,6 +16,7 @@ kotlin {
     }
 
     sourceSets.wasmWasiMain.dependencies {
-        implementation(libs.kotlin.coroutines.core)
+        api(libs.kotlin.coroutines.core)
+        api("org.jetbrains.kotlinx:kotlinx-io-core:0.9.1")
     }
 }

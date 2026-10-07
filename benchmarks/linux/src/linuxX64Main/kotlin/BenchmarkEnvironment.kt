@@ -39,7 +39,7 @@ internal class BenchmarkEnvironment private constructor(
     companion object {
         suspend fun load(): BenchmarkEnvironment {
             val runtimeDir = "./demo/client/build/wasmtime/runtime"
-            val guestPath = "./benchmarks/guest/build/wasmtime/benchmark-guest.wasm"
+            val guestPath = "./benchmarks/guest/build/wasmtime/extension/extension.wasm"
             val storageRoot = "/tmp/wasmtime-kmp-benchmark"
             val guestStorage = "$storageRoot/guest"
 

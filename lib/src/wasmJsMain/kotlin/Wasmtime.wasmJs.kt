@@ -36,18 +36,24 @@ internal actual fun createPlatformWasmtimeExtensionTransport(
     httpHandler: WasmtimeHttpHandler?,
     storage: WasmtimeStorage?,
     runtime: WasmtimeRuntime?,
+    maxArgumentBytes: Int,
     maxResultBytes: Int,
 ): WasmtimeExtensionTransport? {
     if (!jsWorkerAvailable()) {
         return if (jsIsBrowser()) {
-            WasmtimeExtensionTransport {
-                error("Web Workers are required to execute untrusted Wasm extensions in the browser")
+            object : WasmtimeExtensionTransport {
+                override suspend fun invoke(methodId: Int, arguments: ByteArray): ByteArray =
+                    error("Web Workers are required to execute untrusted Wasm extensions in the browser")
             }
         } else {
             null
         }
     }
-    return WasmtimeExtensionTransport { methodId ->
+    return object : WasmtimeExtensionTransport {
+        override suspend fun invoke(methodId: Int, arguments: ByteArray): ByteArray {
+        require(maxArgumentBytes == 0 || arguments.size <= maxArgumentBytes) {
+            "extension argument payload is too large: ${arguments.size} > $maxArgumentBytes bytes"
+        }
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val task = jsRunExtensionWorker(
             instantiateSource = WASM_JS_HOST_SOURCE,
@@ -67,15 +73,18 @@ internal actual fun createPlatformWasmtimeExtensionTransport(
             storageMaxFileBytes = storage?.maxFileBytes?.toDouble() ?: 0.0,
             maxExecutionMillis = limits.maxExecutionMillis.toDouble(),
             methodId = methodId,
+            arguments = arguments.toJsUint8Array(),
+            maxArgumentBytes = maxArgumentBytes,
             maxResultBytes = maxResultBytes,
         ) { metadata, body ->
             workerHttpPromise(scope, httpHandler, limits, metadata, body)
         }
-        try {
+        return try {
             task.awaitWorkerBytes()
         } finally {
             scope.cancel()
             jsCancelExtensionWorkerTask(task)
+        }
         }
     }
 }
@@ -126,6 +135,14 @@ private suspend fun JsAny.awaitWorkerBytes(): ByteArray =
                     when (jsErrorName(reason)) {
                         "WasmtimeExtensionCancelled", "WasmtimeExtensionTimeout" ->
                             continuation.resumeWithException(CancellationException(message))
+                        "WasmtimeExtensionRemote" ->
+                            continuation.resumeWithException(
+                                WasmtimeExtensionException(
+                                    remoteType = jsErrorRemoteType(reason).ifBlank { "Throwable" },
+                                    message = message,
+                                    guestStackTrace = jsErrorGuestStack(reason).ifBlank { null },
+                                )
+                            )
                         else -> continuation.resumeWithException(IllegalStateException(message))
                     }
                 }
@@ -898,7 +915,7 @@ private external fun jsIsBrowser(): Boolean
     """(instantiateSource, wasm, runtimeModules, storagePath, guestPath, storageReadOnly,
         maxMemoryBytes, maxTableElements, maxModuleBytes, maxHostCallBytes, maxOutputBytes,
         maxWasiPollMillis, storageMaxBytes, storageMaxEntries, storageMaxFileBytes,
-        maxExecutionMillis, methodId, maxResultBytes, executeHttp) => {
+        maxExecutionMillis, methodId, arguments, maxArgumentBytes, maxResultBytes, executeHttp) => {
         let worker = null;
         let timer = null;
         let objectUrl = null;
@@ -1073,7 +1090,29 @@ const messageBytes = (exports, lengthName, byteName, maxBytes) => {
     for (let i = 0; i < length; i++) bytes[i] = byteFn(i, 0) & 255;
     return bytes;
 };
-const decodeMessage = (bytes) => bytes.length === 0 ? 'unknown extension error' : new TextDecoder().decode(bytes);
+const decodeFailure = (bytes) => {
+    if (bytes.length < 4 || bytes[0] !== 87 || bytes[1] !== 69 || bytes[2] !== 88 || bytes[3] !== 1) {
+        return { type: 'Throwable', message: bytes.length === 0 ? 'unknown extension error' : new TextDecoder().decode(bytes), stack: '' };
+    }
+    let offset = 4;
+    const readField = () => {
+        if (offset + 4 > bytes.length) return '';
+        const length = (bytes[offset]) |
+            (bytes[offset + 1] << 8) |
+            (bytes[offset + 2] << 16) |
+            (bytes[offset + 3] << 24);
+        offset += 4;
+        if (length < 0 || offset + length > bytes.length) return '';
+        const value = new TextDecoder().decode(bytes.slice(offset, offset + length));
+        offset += length;
+        return value;
+    };
+    return {
+        type: readField() || 'Throwable',
+        message: readField() || 'extension call failed',
+        stack: readField(),
+    };
+};
 const executeHttp = (metadata, body) => new Promise((resolve, reject) => {
     const id = nextHttpId++;
     pendingHttp.set(id, { resolve, reject });
@@ -1117,10 +1156,22 @@ self.onmessage = async (event) => {
         );
         checkMemory(runtime, msg.maxMemoryBytes);
         const ex = runtime.instance.exports;
+        const prepareArguments = ex['__wasmtime_extension_argument_prepare'];
+        const setArgumentByte = ex['__wasmtime_extension_argument_byte'];
         const start = ex['__wasmtime_extension_start'];
         const poll = ex['__wasmtime_extension_poll'];
         const nextWake = ex['__wasmtime_extension_next_wake_millis'];
         const cancel = ex['__wasmtime_extension_cancel'];
+        if (msg.maxArgumentBytes > 0 && msg.arguments.length > msg.maxArgumentBytes) {
+            throw new Error('extension argument payload exceeds configured size limit');
+        }
+        if (typeof prepareArguments !== 'function' || typeof setArgumentByte !== 'function') {
+            throw new Error('required extension argument exports are missing');
+        }
+        if ((prepareArguments(msg.arguments.length, 0) | 0) !== 0) throw new Error('extension rejected argument payload');
+        for (let i = 0; i < msg.arguments.length; i++) {
+            if ((setArgumentByte(i, msg.arguments[i]) | 0) !== 0) throw new Error('extension rejected argument byte ' + i);
+        }
         let state = await invokeAsync(start, msg.methodId, 0);
         let lastPoll = performance.now();
         try {
@@ -1144,10 +1195,10 @@ self.onmessage = async (event) => {
             self.postMessage({ type: 'result', bytes }, [bytes.buffer]);
         } else if (state === FAILURE) {
             const bytes = messageBytes(ex, '__wasmtime_extension_error_length', '__wasmtime_extension_error_byte', msg.maxResultBytes);
-            self.postMessage({ type: 'failure', message: 'extension call failed: ' + decodeMessage(bytes) });
+            self.postMessage({ type: 'failure', failure: decodeFailure(bytes) });
         } else if (state === CANCELLED) {
             const bytes = messageBytes(ex, '__wasmtime_extension_error_length', '__wasmtime_extension_error_byte', msg.maxResultBytes);
-            self.postMessage({ type: 'cancelled', message: 'extension call cancelled: ' + decodeMessage(bytes) });
+            self.postMessage({ type: 'cancelled', failure: decodeFailure(bytes) });
         } else {
             throw new Error('invalid extension call state: ' + state);
         }
@@ -1218,11 +1269,19 @@ self.onmessage = async (event) => {
                 if (msg.type === 'result') {
                     finish(resolve, msg.bytes);
                 } else if (msg.type === 'cancelled') {
-                    const error = new Error(msg.message || 'extension call cancelled');
+                    const failure = msg.failure || {};
+                    const error = new Error(failure.message || 'extension call cancelled');
                     error.name = 'WasmtimeExtensionCancelled';
+                    error.remoteType = failure.type || 'CancellationException';
+                    error.guestStack = failure.stack || '';
                     finish(reject, error);
                 } else if (msg.type === 'failure') {
-                    finish(reject, new Error(msg.message || 'extension call failed'));
+                    const failure = msg.failure || {};
+                    const error = new Error(failure.message || 'extension call failed');
+                    error.name = 'WasmtimeExtensionRemote';
+                    error.remoteType = failure.type || 'Throwable';
+                    error.guestStack = failure.stack || '';
+                    finish(reject, error);
                 }
             };
             worker.onerror = (event) => finish(reject, new Error(event.message || 'extension worker failed'));
@@ -1239,7 +1298,7 @@ self.onmessage = async (event) => {
                 type: 'run', wasm, runtimeModules, storagePath, guestPath, storageReadOnly,
                 maxMemoryBytes, maxTableElements, maxModuleBytes, maxHostCallBytes, maxOutputBytes,
                 maxWasiPollMillis, storageMaxBytes, storageMaxEntries, storageMaxFileBytes,
-                methodId, maxResultBytes,
+                methodId, arguments, maxArgumentBytes, maxResultBytes,
             });
         });
 
@@ -1280,6 +1339,8 @@ private external fun jsRunExtensionWorker(
     storageMaxFileBytes: Double,
     maxExecutionMillis: Double,
     methodId: Int,
+    arguments: JsAny,
+    maxArgumentBytes: Int,
     maxResultBytes: Int,
     executeHttp: (JsAny, JsAny) -> Promise<JsAny>,
 ): JsAny
@@ -1304,6 +1365,12 @@ private external fun jsError(message: String): JsAny
 
 @JsFun("(error) => error && error.message ? String(error.message) : String(error)")
 private external fun jsErrorMessage(error: JsAny): String
+
+@JsFun("(error) => error && error.remoteType ? String(error.remoteType) : ''")
+private external fun jsErrorRemoteType(error: JsAny): String
+
+@JsFun("(error) => error && error.guestStack ? String(error.guestStack) : ''")
+private external fun jsErrorGuestStack(error: JsAny): String
 
 @JsFun("(runtime) => runtime.memory.buffer.byteLength")
 private external fun jsMemorySize(runtime: JsAny): Int

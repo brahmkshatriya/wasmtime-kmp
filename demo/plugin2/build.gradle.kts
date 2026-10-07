@@ -12,7 +12,9 @@ wasmtime {
 
 wasmtimeExtension {
     contractInterface.set("dev.brahmkshatriya.wasmtime.demo.shared.Plugin")
-    entryPointAnnotation.set("dev.brahmkshatriya.wasmtime.demo.shared.ExtensionEntry")
+    implementationClass.set("dev.brahmkshatriya.wasmtime.demo.plugin2.ProductPlugin")
+    displayName.set("Product Plugin 2")
+    capabilities("Http", "PersistentStorage", "Credentials", "Logging", "Streaming")
     compileOnlyDependencies {
         useExtensionApi("demo")
     }

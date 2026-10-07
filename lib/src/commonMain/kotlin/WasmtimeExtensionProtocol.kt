@@ -6,6 +6,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
+import kotlinx.coroutines.sync.withLock
 import kotlin.time.TimeSource
 
 /**
@@ -17,10 +18,20 @@ import kotlin.time.TimeSource
  *
  * [invoke] is suspend because a guest contract method may suspend on guest timers or asynchronous host calls.
  */
-public fun interface WasmtimeExtensionTransport {
-    /** Invokes one generated contract method and returns its serialized result bytes. */
-    public suspend fun invoke(methodId: Int): ByteArray
+public interface WasmtimeExtensionTransport {
+    /** Invokes one generated contract method with its serialized argument payload. */
+    public suspend fun invoke(methodId: Int, arguments: ByteArray = ByteArray(0)): ByteArray
+
+    /** Releases any reusable Wasm instance owned by this transport. */
+    public fun close() {}
 }
+
+/** Structured exception reconstructed from a failure thrown inside the guest extension. */
+public class WasmtimeExtensionException(
+    public val remoteType: String,
+    message: String,
+    public val guestStackTrace: String? = null,
+) : RuntimeException(message)
 
 /**
  * Creates a transport for a generated Wasmtime contract proxy.
@@ -49,9 +60,10 @@ public fun interface WasmtimeExtensionTransport {
 public fun createWasmtimeExtensionTransport(
     wasm: ByteArray,
     limits: WasmtimeLimits = WasmtimeLimits(),
-    httpHandler: WasmtimeHttpHandler? = null,
-    storage: WasmtimeStorage? = null,
+    services: WasmtimeHostServices = WasmtimeHostServices(),
     runtime: WasmtimeRuntime? = null,
+    manifest: WasmtimeExtensionManifest? = null,
+    maxArgumentBytes: Int = limits.maxHostCallBytes,
     maxResultBytes: Int = 16 * 1024 * 1024,
 ): WasmtimeExtensionTransport {
     require(wasm.isNotEmpty()) { "wasm must not be empty" }
@@ -59,35 +71,69 @@ public fun createWasmtimeExtensionTransport(
         "wasm module is too large: ${wasm.size} > ${limits.maxModuleBytes} bytes"
     }
     validateRuntimeModuleSizes(limits, runtime)
+    require(maxArgumentBytes >= 0) { "maxArgumentBytes must be >= 0" }
     require(maxResultBytes >= 0) { "maxResultBytes must be >= 0" }
     createPlatformWasmtimeExtensionTransport(
         wasm = wasm,
         limits = limits,
-        httpHandler = httpHandler,
-        storage = storage,
+        httpHandler = services.effectiveHttp(manifest?.id),
+        storage = services.effectiveStorage(),
         runtime = runtime,
+        maxArgumentBytes = maxArgumentBytes,
         maxResultBytes = maxResultBytes,
     )?.let { return it }
-    return WasmtimeExtensionTransport { methodId ->
-        withContext(Dispatchers.Default) {
-            val instance = Wasmtime.load(
-                wasm = wasm,
-                limits = limits,
-                httpHandler = httpHandler,
-                storage = storage,
-                runtime = runtime,
-            )
-            try {
-                if (limits.maxExecutionMillis > 0) {
-                    withTimeout(limits.maxExecutionMillis) {
-                        instance.callExtension(methodId, maxResultBytes)
+
+    val instance = Wasmtime.load(
+        wasm = wasm,
+        limits = limits,
+        httpHandler = services.effectiveHttp(manifest?.id),
+        storage = services.effectiveStorage(),
+        runtime = runtime,
+    )
+    val lock = kotlinx.coroutines.sync.Mutex()
+    return object : WasmtimeExtensionTransport {
+        override suspend fun invoke(methodId: Int, arguments: ByteArray): ByteArray =
+            lock.withLock {
+                services.logger?.log(
+                    WasmtimeExtensionLogEvent(
+                        manifest?.id,
+                        WasmtimeExtensionLogEvent.Level.Debug,
+                        "Calling extension method $methodId (${arguments.size} argument bytes)",
+                    )
+                )
+                try {
+                    withContext(Dispatchers.Default) {
+                        if (limits.maxExecutionMillis > 0) {
+                            withTimeout(limits.maxExecutionMillis) {
+                                instance.callExtension(methodId, arguments, maxArgumentBytes, maxResultBytes)
+                            }
+                        } else {
+                            instance.callExtension(methodId, arguments, maxArgumentBytes, maxResultBytes)
+                        }
+                    }.also { result ->
+                        services.logger?.log(
+                            WasmtimeExtensionLogEvent(
+                                manifest?.id,
+                                WasmtimeExtensionLogEvent.Level.Debug,
+                                "Extension method $methodId completed (${result.size} result bytes)",
+                            )
+                        )
                     }
-                } else {
-                    instance.callExtension(methodId, maxResultBytes)
+                } catch (failure: Throwable) {
+                    services.logger?.log(
+                        WasmtimeExtensionLogEvent(
+                            manifest?.id,
+                            WasmtimeExtensionLogEvent.Level.Error,
+                            "Extension method $methodId failed",
+                            failure,
+                        )
+                    )
+                    throw failure
                 }
-            } finally {
-                instance.close()
             }
+
+        override fun close() {
+            instance.close()
         }
     }
 }
@@ -98,6 +144,7 @@ internal expect fun createPlatformWasmtimeExtensionTransport(
     httpHandler: WasmtimeHttpHandler?,
     storage: WasmtimeStorage?,
     runtime: WasmtimeRuntime?,
+    maxArgumentBytes: Int,
     maxResultBytes: Int,
 ): WasmtimeExtensionTransport?
 
@@ -114,10 +161,18 @@ internal expect fun createPlatformWasmtimeExtensionTransport(
  */
 public suspend fun WasmtimeInstance.callExtension(
     methodId: Int,
+    arguments: ByteArray = ByteArray(0),
+    maxArgumentBytes: Int = WasmtimeLimits().maxHostCallBytes,
     maxResultBytes: Int = 16 * 1024 * 1024,
 ): ByteArray {
+    require(maxArgumentBytes >= 0) { "maxArgumentBytes must be >= 0" }
+    require(maxArgumentBytes == 0 || arguments.size <= maxArgumentBytes) {
+        "extension argument payload is too large: ${arguments.size} > $maxArgumentBytes bytes"
+    }
     require(maxResultBytes >= 0) { "maxResultBytes must be >= 0" }
 
+    val prepareArguments = functionI32(ExtensionProtocol.ARGUMENT_PREPARE)
+    val setArgumentByte = functionI32(ExtensionProtocol.ARGUMENT_BYTE)
     val start = functionI32(ExtensionProtocol.START)
     val poll = functionI32(ExtensionProtocol.POLL)
     val nextWakeMillis = functionI32(ExtensionProtocol.NEXT_WAKE_MILLIS)
@@ -126,6 +181,13 @@ public suspend fun WasmtimeInstance.callExtension(
     val resultByte = functionI32(ExtensionProtocol.RESULT_BYTE)
     val errorLength = functionI32(ExtensionProtocol.ERROR_LENGTH)
     val errorByte = functionI32(ExtensionProtocol.ERROR_BYTE)
+
+    check(prepareArguments(arguments.size, 0) == 0) { "extension rejected argument payload" }
+    arguments.forEachIndexed { index, byte ->
+        check(setArgumentByte(index, byte.toInt() and 0xff) == 0) {
+            "extension rejected argument byte $index"
+        }
+    }
 
     var state = start.invokeAsync(methodId, 0)
     var elapsedFromLastPoll = TimeSource.Monotonic.markNow()
@@ -155,13 +217,14 @@ public suspend fun WasmtimeInstance.callExtension(
             }
 
             ExtensionProtocol.FAILURE -> {
-                val message = readExtensionMessage(errorLength, errorByte, maxResultBytes)
-                error("extension call failed: $message")
+                val bytes = readExtensionBytes(errorLength, errorByte, maxResultBytes)
+                throw decodeExtensionFailure(bytes)
             }
 
             ExtensionProtocol.CANCELLED -> {
-                val message = readExtensionMessage(errorLength, errorByte, maxResultBytes)
-                throw CancellationException("extension call cancelled: $message")
+                val bytes = readExtensionBytes(errorLength, errorByte, maxResultBytes)
+                val failure = decodeExtensionFailure(bytes)
+                throw CancellationException("extension call cancelled: ${failure.message}")
             }
 
             else -> error("invalid extension call state: $state")
@@ -171,18 +234,41 @@ public suspend fun WasmtimeInstance.callExtension(
     }
 }
 
-private fun readExtensionMessage(
+private fun readExtensionBytes(
     lengthFunction: WasmtimeI32Function,
     byteFunction: WasmtimeI32Function,
     maxBytes: Int,
-): String {
+): ByteArray {
     val length = lengthFunction(0, 0)
-    if (length <= 0) return "unknown extension error"
+    if (length <= 0) return ByteArray(0)
     require(length <= maxBytes) { "invalid extension error length: $length" }
-    return ByteArray(length) { index -> byteFunction(index, 0).toByte() }.decodeToString()
+    return ByteArray(length) { index -> byteFunction(index, 0).toByte() }
+}
+
+private fun decodeExtensionFailure(bytes: ByteArray): WasmtimeExtensionException {
+    if (bytes.size < 4 || bytes[0] != 'W'.code.toByte() || bytes[1] != 'E'.code.toByte() || bytes[2] != 'X'.code.toByte()) {
+        return WasmtimeExtensionException("Throwable", bytes.decodeToString().ifBlank { "unknown extension error" })
+    }
+    var offset = 4
+    fun field(): String {
+        if (offset + 4 > bytes.size) return ""
+        val length = (bytes[offset].toInt() and 0xff) or
+            ((bytes[offset + 1].toInt() and 0xff) shl 8) or
+            ((bytes[offset + 2].toInt() and 0xff) shl 16) or
+            ((bytes[offset + 3].toInt() and 0xff) shl 24)
+        offset += 4
+        if (length < 0 || offset + length > bytes.size) return ""
+        return bytes.copyOfRange(offset, offset + length).decodeToString().also { offset += length }
+    }
+    val type = field().ifBlank { "Throwable" }
+    val message = field().ifBlank { "extension call failed" }
+    val stack = field().takeIf(String::isNotBlank)
+    return WasmtimeExtensionException(type, message, stack)
 }
 
 private object ExtensionProtocol {
+    const val ARGUMENT_PREPARE = "__wasmtime_extension_argument_prepare"
+    const val ARGUMENT_BYTE = "__wasmtime_extension_argument_byte"
     const val START = "__wasmtime_extension_start"
     const val POLL = "__wasmtime_extension_poll"
     const val NEXT_WAKE_MILLIS = "__wasmtime_extension_next_wake_millis"

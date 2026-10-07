@@ -13,8 +13,11 @@ import org.gradle.api.attributes.LibraryElements
 import org.gradle.api.attributes.Usage
 import org.gradle.api.attributes.java.TargetJvmEnvironment
 import org.gradle.api.file.ConfigurableFileCollection
+import org.gradle.api.file.Directory
 import org.gradle.api.model.ObjectFactory
+import org.gradle.api.plugins.ExtensionAware
 import org.gradle.api.provider.Property
+import org.gradle.api.provider.Provider
 import org.gradle.api.file.RegularFile
 import org.gradle.api.tasks.TaskProvider
 import org.gradle.api.Task
@@ -32,6 +35,8 @@ private val SDK_VERSION: String =
     WasmtimeExtensionPlugin::class.java.`package`.implementationVersion ?: "unspecified"
 private val GUEST_RUNTIME_COORDINATE: String
     get() = "dev.brahmkshatriya.wasmtime:guest-runtime:$SDK_VERSION"
+private val WASMTIME_ARTIFACT_ATTRIBUTE: Attribute<String> =
+    Attribute.of("dev.brahmkshatriya.wasmtime.artifact", String::class.java)
 
 /**
  * Named dependency set shared between the host runtime and one or more extensions.
@@ -117,13 +122,13 @@ public class WasmtimeDependencyCollector internal constructor(
 /**
  * `wasmtimeExtension { ... }` settings for a Kotlin/Wasm-WASI extension project.
  *
- * A typical contract-based extension only needs [contractInterface], [entryPointAnnotation], and any shared
+ * A typical contract-based extension only needs [contractInterface], [implementationClass], and any shared
  * compile-only API dependencies:
  *
  * ```kotlin
  * wasmtimeExtension {
  *     contractInterface.set("com.example.Plugin")
- *     entryPointAnnotation.set("com.example.ExtensionEntry")
+ *     implementationClass.set("com.example.MyPlugin")
  *     compileOnlyDependencies { useExtensionApi("pluginApi") }
  * }
  * ```
@@ -134,14 +139,23 @@ public open class WasmtimeExtensionSettings internal constructor(
     compileOnlyConfiguration: Configuration,
     settings: WasmtimeSettings,
 ) {
-    /** Final exported Wasm file name under `build/wasmtime/`. Defaults to `<project-name>.wasm`. */
-    public val outputFileName: Property<String> = objects.property(String::class.java)
+    /** Stable extension identifier used in manifests and generated resource paths. */
+    public val extensionId: Property<String> = objects.property(String::class.java)
 
-    /**
-     * Fully-qualified annotation placed on exactly one top-level guest implementation object.
-     * The plugin uses it to discover the contract implementation and generate the guest adapter.
-     */
-    public val entryPointAnnotation: Property<String> = objects.property(String::class.java)
+    /** Human-readable extension name stored in the generated manifest. */
+    public val displayName: Property<String> = objects.property(String::class.java)
+
+    /** Extension implementation version stored in the generated manifest. */
+    public val extensionVersion: Property<String> = objects.property(String::class.java)
+
+    /** Host/guest extension ABI version. */
+    public val apiVersion: Property<Int> = objects.property(Int::class.java)
+
+    /** Declared extension capabilities such as `Http`, `PersistentStorage`, or `Streaming`. */
+    public val capabilities: org.gradle.api.provider.ListProperty<String> = objects.listProperty(String::class.java)
+
+    /** Fully-qualified guest object/class that implements [contractInterface]. */
+    public val implementationClass: Property<String> = objects.property(String::class.java)
 
     /** Fully-qualified suspend contract interface implemented by the guest and proxied on the host. */
     public val contractInterface: Property<String> = objects.property(String::class.java)
@@ -157,6 +171,11 @@ public open class WasmtimeExtensionSettings internal constructor(
      */
     public fun compileOnlyDependencies(configure: Action<in WasmtimeDependencyCollector>) {
         configure.execute(compileOnly)
+    }
+
+    /** Adds one or more capability names to the generated extension manifest. */
+    public fun capabilities(vararg values: String) {
+        capabilities.addAll(values.toList())
     }
 
     /**
@@ -179,12 +198,16 @@ public open class WasmtimeExtensionSettings internal constructor(
 public open class WasmtimeHostSettings internal constructor(
     project: Project,
     runtimeConfiguration: Configuration,
+    extensionConfiguration: Configuration,
     settings: WasmtimeSettings,
     objects: ObjectFactory,
 ) {
     /** Fully-qualified suspend contract interface for which a host-side proxy is generated. */
     public val contractInterface: Property<String> = objects.property(String::class.java)
     private val runtime = WasmtimeDependencyCollector(project, runtimeConfiguration, settings)
+    private val extensions = WasmtimeDependencyCollector(project, extensionConfiguration, settings)
+    private var bundlingEnabled: Boolean = false
+    private var bundlingCallback: (() -> Unit)? = null
 
     /**
      * Adds Wasm/WASI libraries that the host should build into its shared runtime bundle.
@@ -193,6 +216,34 @@ public open class WasmtimeHostSettings internal constructor(
      */
     public fun runtimeDependencies(configure: Action<in WasmtimeDependencyCollector>) {
         configure.execute(runtime)
+    }
+
+    /**
+     * Opts this host into bundled-extension packaging and adds one extension artifact/project.
+     *
+     * Without calling this method the host plugin does not generate `WasmtimeBundledExtensions`, does not
+     * assemble extension resources, and does not modify the application's resource packaging.
+     */
+    public fun bundleExtension(dependency: Any) {
+        if (!bundlingEnabled) {
+            bundlingEnabled = true
+            bundlingCallback?.invoke()
+        }
+        extensions.add(dependency)
+    }
+
+    /** Backwards-compatible alias for [bundleExtension]. */
+    @Deprecated(
+        message = "Bundling is optional. Use bundleExtension(...) to make the packaging behavior explicit.",
+        replaceWith = ReplaceWith("bundleExtension(dependency)"),
+    )
+    public fun extension(dependency: Any) {
+        bundleExtension(dependency)
+    }
+
+    internal fun onBundlingEnabled(callback: () -> Unit) {
+        bundlingCallback = callback
+        if (bundlingEnabled) callback()
     }
 }
 
@@ -271,19 +322,19 @@ class WasmtimeExtensionPlugin : Plugin<Project> {
             compileOnly,
             sharedSettings,
         )
-        settings.outputFileName.convention("${project.name}.wasm")
+        settings.extensionId.convention(project.name)
+        settings.displayName.convention(project.name)
+        settings.extensionVersion.convention(providers.provider { project.version.toString() })
+        settings.apiVersion.convention(1)
+        settings.capabilities.convention(emptyList())
         dependencies.add(compileOnly.name, guestRuntimeDependency())
 
         val generatedAdapter = tasks.register<GenerateWasmtimeExtensionAdapterTask>(
             "generateWasmtimeExtensionAdapter"
         ) {
-            kotlinSources.from(
-                fileTree("src/commonMain/kotlin") { include("**/*.kt") },
-                fileTree("src/wasmWasiMain/kotlin") { include("**/*.kt") },
-            )
             apiKlibs.from(configurations.named("wasmWasiCompileClasspath"))
             toolClasspath.from(contractTool)
-            entryPointAnnotation.set(settings.entryPointAnnotation)
+            implementationClass.set(settings.implementationClass)
             contractInterface.set(settings.contractInterface)
             outputDirectory.convention(layout.buildDirectory.dir("generated/wasmtimeExtension/kotlin"))
         }
@@ -307,7 +358,7 @@ class WasmtimeExtensionPlugin : Plugin<Project> {
         }
 
         val pruner = registerTypePruner()
-        tasks.register<ExportWasmtimeExtensionTask>("exportWasmtimeExtension") {
+        val export = tasks.register<ExportWasmtimeExtensionTask>("exportWasmtimeExtension") {
             group = "wasmtime"
             description = "Exports the production Wasm extension with metadata and dead GC types removed."
             dependsOn("compileKotlinWasmWasi", pruner.task)
@@ -315,9 +366,31 @@ class WasmtimeExtensionPlugin : Plugin<Project> {
             externalLibraries.from(configurations.named("wasmWasiCompileClasspath"))
             compilerClasspath.from(compiler)
             typePruner.convention(pruner.output)
-            outputWasm.convention(settings.outputFileName.flatMap { name ->
-                layout.buildDirectory.file("wasmtime/$name")
-            })
+            extensionId.set(settings.extensionId)
+            extensionName.set(settings.displayName)
+            extensionVersion.set(settings.extensionVersion)
+            apiVersion.set(settings.apiVersion)
+            contractInterface.set(settings.contractInterface)
+            capabilities.set(settings.capabilities)
+            outputWasm.convention(layout.buildDirectory.file("wasmtime/extension/extension.wasm"))
+            outputManifest.convention(layout.buildDirectory.file("wasmtime/extension/extension.properties"))
+        }
+
+        val extensionElements = configurations.create("wasmtimeExtensionElements") {
+            isCanBeConsumed = true
+            isCanBeResolved = false
+            description = "Packaged Wasmtime extension artifact consumed by host projects."
+            attributes {
+                attribute(Category.CATEGORY_ATTRIBUTE, objects.named(Category.LIBRARY))
+                attribute(WASMTIME_ARTIFACT_ATTRIBUTE, "extension-bundle")
+            }
+        }
+        artifacts.add(
+            extensionElements.name,
+            layout.buildDirectory.dir("wasmtime/extension"),
+        ) {
+            builtBy(export)
+            type = "directory"
         }
         Unit
     }
@@ -328,11 +401,21 @@ class WasmtimeExtensionPlugin : Plugin<Project> {
  *
  * It creates the typed [WasmtimeHostSettings] DSL, generates a host proxy for the configured contract, and
  * registers `buildWasmtimeRuntime`, which produces an ordered `runtime.tsv` plus shared Wasm modules.
+ * Bundled-extension source/resource generation is opt-in through [WasmtimeHostSettings.bundleExtension].
  */
 class WasmtimeHostPlugin : Plugin<Project> {
     override fun apply(project: Project) = with(project) {
         val sharedSettings = wasmtimeSettings()
         val contractTool = contractToolClasspath()
+        val extensionArtifacts = configurations.create("wasmtimeExtensions") {
+            isCanBeConsumed = false
+            isCanBeResolved = true
+            description = "Resolved packaged Wasmtime extension artifacts."
+            attributes {
+                attribute(Category.CATEGORY_ATTRIBUTE, objects.named(Category.LIBRARY))
+                attribute(WASMTIME_ARTIFACT_ATTRIBUTE, "extension-bundle")
+            }
+        }
         val runtime = configurations.create("wasmtimeRuntime") {
             isCanBeConsumed = false
             isCanBeResolved = false
@@ -368,6 +451,7 @@ class WasmtimeHostPlugin : Plugin<Project> {
             WasmtimeHostSettings::class.java,
             this,
             runtime,
+            extensionArtifacts,
             sharedSettings,
             objects,
         )
@@ -401,7 +485,7 @@ class WasmtimeHostPlugin : Plugin<Project> {
         }
 
         val pruner = registerTypePruner()
-        tasks.register<BuildWasmtimeRuntimeTask>("buildWasmtimeRuntime") {
+        val runtimeBundle = tasks.register<BuildWasmtimeRuntimeTask>("buildWasmtimeRuntime") {
             group = "wasmtime"
             description = "Builds, strips, prunes, validates, and manifests the host Wasmtime runtime modules."
             dependsOn(pruner.task)
@@ -409,6 +493,51 @@ class WasmtimeHostPlugin : Plugin<Project> {
             compilerClasspath.from(compiler)
             typePruner.convention(pruner.output)
             outputDirectory.convention(layout.buildDirectory.dir("wasmtime/runtime"))
+        }
+
+        hostSettings.onBundlingEnabled {
+            val generatedResources = tasks.register<AssembleWasmtimeHostResourcesTask>(
+                "assembleWasmtimeHostResources"
+            ) {
+                dependsOn(runtimeBundle)
+                runtimeDirectory.set(runtimeBundle.flatMap { it.outputDirectory })
+                extensionBundles.from(extensionArtifacts)
+                outputDirectory.convention(layout.buildDirectory.dir("generated/wasmtimeHost/resources"))
+            }
+            val generatedArtifacts = tasks.register<GenerateWasmtimeArtifactsSourceTask>(
+                "generateWasmtimeArtifactsSource"
+            ) {
+                extensionBundles.from(extensionArtifacts)
+                outputDirectory.convention(layout.buildDirectory.dir("generated/wasmtimeHost/artifacts"))
+            }
+
+            pluginManager.withPlugin("org.jetbrains.kotlin.multiplatform") {
+                extensions.getByType<KotlinMultiplatformExtension>()
+                    .sourceSets.named("commonMain") {
+                        kotlin.srcDir(generatedArtifacts.flatMap { it.outputDirectory })
+                        resources.srcDir(generatedResources.flatMap { it.outputDirectory })
+                    }
+                tasks.matching { it.name.startsWith("compileKotlin") }.configureEach {
+                    dependsOn(generatedArtifacts)
+                }
+            }
+
+            // Compose Multiplatform uses its own resource pipeline. Register generated extension resources only
+            // after the consumer has explicitly opted into bundled-extension packaging.
+            pluginManager.withPlugin("org.jetbrains.compose") {
+                val compose = extensions.findByName("compose") as? ExtensionAware
+                val resources = compose?.extensions?.findByName("resources")
+                val method = resources?.javaClass?.methods?.firstOrNull { candidate ->
+                    candidate.name == "customDirectory" && candidate.parameterTypes.size == 2
+                }
+                if (resources != null && method != null) {
+                    method.invoke(
+                        resources,
+                        "commonMain",
+                        generatedResources.flatMap { it.outputDirectory },
+                    )
+                }
+            }
         }
         Unit
     }
