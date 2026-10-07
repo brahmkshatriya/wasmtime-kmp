@@ -3,22 +3,18 @@
 [![Maven Central](https://img.shields.io/maven-central/v/dev.brahmkshatriya.wasmtime/lib?label=Maven%20Central)](https://central.sonatype.com/artifact/dev.brahmkshatriya.wasmtime/lib)
 [![CI](https://github.com/brahmkshatriya/wasmtime-kmp/actions/workflows/publish.yml/badge.svg)](https://github.com/brahmkshatriya/wasmtime-kmp/actions/workflows/publish.yml)
 
-Run WebAssembly from Kotlin Multiplatform using Wasmtime.
+Run WebAssembly from Kotlin Multiplatform with Wasmtime.
 
-Use as much or as little of the library as you need:
+| Use case | API |
+| --- | --- |
+| Run arbitrary Wasm | `Wasmtime.load(...)` and the low-level runtime |
+| Build Kotlin plugins/extensions | Generated typed contracts with the Gradle plugins |
 
-- load arbitrary Wasm bytes and call exports directly;
-- generate a typed Kotlin proxy for Kotlin/Wasm extensions;
-- optionally let Gradle build and package extension projects for you;
-- optionally expose host services such as HTTP, storage, credentials, logging, and streams.
+Supported hosts include Android, Linux, Windows, macOS, iOS, JVM on Linux, and Browser/WasmJS.
 
-Replace `VERSION` below with the version shown by the Maven Central badge.
+Replace `VERSION` below with the version shown by the Maven Central badge. `mavenCentral()` must be available to both plugin management and normal dependencies.
 
-Make sure `mavenCentral()` is available in both `pluginManagement.repositories` and your normal dependency repositories.
-
-## Quick start: run arbitrary Wasm
-
-Add the runtime to `commonMain`:
+## Install
 
 ```kotlin
 kotlin {
@@ -28,7 +24,7 @@ kotlin {
 }
 ```
 
-Then load any Wasm bytes you provide:
+## Run arbitrary Wasm
 
 ```kotlin
 val instance = Wasmtime.load(wasmBytes)
@@ -40,42 +36,37 @@ try {
 }
 ```
 
-`wasmtime-kmp` does not require a particular resource format or packaging strategy. `wasmBytes` can come from app resources, disk, a download, a database, or anywhere else.
+`wasmBytes` can come from resources, disk, network, a database, or any packaging format you choose.
 
-Use `invokeAsync` / `callI32Async` when a Wasm call can wait on asynchronous host work.
+The low-level API supports `i32`, `i64`, `f32`, and `f64`, exported memory access, host imports, and async calls. For C/Rust/Go-style pointer ABIs, `cAbi()` adds helpers for strings, primitive arrays, nullable pointers, allocation/release, and packed pointer/length values. You can always use `instance.function(...)` and `instance.memory(...)` directly for a custom ABI.
 
-## Supported hosts
+## Typed Kotlin extensions
 
-| Host | Support |
-| --- | --- |
-| Android ARM64 / x86_64 | Yes |
-| Linux x64 / ARM64 | Yes |
-| Windows x64 | Yes |
-| macOS x64 / ARM64 | Yes |
-| iOS ARM64 | Yes |
-| JVM on Linux x64 / ARM64 | Yes |
-| Browser (Wasm/JS) | Yes |
+Use this when both the host and extension are Kotlin. Your application calls a normal Kotlin interface; generated code handles the Wasm boundary.
 
-## Optional: typed Kotlin extensions
-
-If both sides are Kotlin, you can describe the extension as a normal suspend interface and let the Gradle plugins generate the Wasm adapter and host proxy.
-
-### 1. Share a contract
+### 1. Define a shared contract
 
 ```kotlin
 interface Plugin {
-    suspend fun greeting(name: String): Greeting
+    val name: String
+    fun version(): Int
+
+    suspend fun greeting(user: String): Greeting
+    suspend fun items(): List<Item>
 }
 
-@kotlinx.serialization.Serializable
+@Serializable
 data class Greeting(val message: String)
+
+@Serializable
+data class Item(val id: String, val title: String)
 ```
 
-Contract parameters and return values should use concrete serializable types. `Unit` is supported.
+Generated contracts support synchronous and `suspend` functions, `val`/`var` properties, inherited non-generic interfaces, nullable values, and concrete serializable generic types such as `List<Item>` or `Map<String, Item>`.
+
+Contract values are encoded with CBOR. Open type parameters such as `fun <T> value(): T` and generic superinterfaces are not generated.
 
 ### 2. Implement the extension
-
-Apply the extension plugin:
 
 ```kotlin
 plugins {
@@ -99,26 +90,27 @@ wasmtimeExtension {
 }
 ```
 
-Implement the interface normally:
-
 ```kotlin
 object MyPlugin : Plugin {
-    override suspend fun greeting(name: String) =
-        Greeting("Hello, $name from Wasm")
+    override val name = "Example"
+    override fun version() = 1
+
+    override suspend fun greeting(user: String) =
+        Greeting("Hello, $user from Wasm")
+
+    override suspend fun items() = listOf(Item("1", "First"))
 }
 ```
 
-Build the standalone extension with:
+Build a standalone bundle with:
 
 ```shell
 ./gradlew :plugin:exportWasmtimeExtension
 ```
 
-The exported bundle is under `build/wasmtime/extension/` and contains `extension.wasm` plus its manifest. You are still free to package or distribute that output however you want.
+The bundle is written under `build/wasmtime/extension/` and contains `extension.wasm` plus its manifest.
 
-### 3. Generate a host proxy
-
-Apply the host plugin:
+### 3. Configure the host
 
 ```kotlin
 plugins {
@@ -140,11 +132,9 @@ wasmtimeHost {
 }
 ```
 
-This generates `PluginWasmtimeProxy` and the shared Kotlin/Wasm runtime. It does not change how your app packages extension Wasm.
+This generates `PluginWasmtimeProxy` and the shared Kotlin/Wasm runtime.
 
-## Optional: automatic extension packaging
-
-If you want Gradle to build an extension project and put it into your application resources, opt in explicitly:
+To let Gradle also package an extension into application resources:
 
 ```kotlin
 wasmtimeHost {
@@ -157,15 +147,9 @@ wasmtimeHost {
 }
 ```
 
-`bundleExtension(...)` enables the convenience packaging layer. It generates `WasmtimeBundledExtensions` and wires the generated runtime/extension resources into KMP resources (and Compose resources when used).
+`bundleExtension(...)` is optional. Without it, the library does not change your extension packaging.
 
-Without `bundleExtension(...)`:
-
-- `WasmtimeBundledExtensions` is not generated;
-- extension resource assembly tasks are not registered;
-- your app's resource packaging is untouched.
-
-Load a bundled extension like this:
+### 4. Load the extension
 
 ```kotlin
 val runtime = loadWasmtimeBundledRuntime(
@@ -182,55 +166,31 @@ val loaded = WasmtimeBundledExtensions.example.load(
 )
 
 try {
+    println(loaded.api.name)
     println(loaded.api.greeting("Ada").message)
 } finally {
     loaded.shutdown()
 }
 ```
 
-The bundled loader validates the manifest, API version, contract, and requested host capabilities before running the extension.
+The loader validates the manifest, API version, contract, and required host capabilities before running guest code.
 
-## Host services
+## Host capabilities
 
-Typed extensions can request host capabilities. The host decides which services to provide through `WasmtimeHostServices`.
+Extensions can request services from the host instead of implementing privileged behavior themselves.
 
-| Service | Guest API | Typical use |
+| Capability | Guest API | Purpose |
 | --- | --- | --- |
-| HTTP | `ExtensionHttp` | Make network requests through the host |
-| Credentials | `credential = "name"` | Let the host attach secrets without exposing them to guest code |
-| Storage | `ExtensionStorage` | Persistent, cache, and temporary extension data |
-| Logging | `ExtensionLog` | Structured extension logs |
-| Resources | `ExtensionResources` | Pull large host-owned data in bounded chunks |
+| `Http` | `ExtensionHttp` | Network requests through the host |
+| `Credentials` | `credential = "name"` | Host-managed secrets |
+| `PersistentStorage` | `ExtensionStorage.persistentPath(...)` | Persistent data |
+| `CacheStorage` | `ExtensionStorage.cachePath(...)` | Cache data |
+| `TemporaryStorage` | `ExtensionStorage.temporaryPath(...)` | Temporary files |
+| `Logging` | `ExtensionLog` | Structured logging |
+| `Streaming` | `ExtensionResources` | Pull large named resources in chunks |
+| `HostResources` | `ExtensionHostResource` / callback / stream | Host-owned callbacks, streams, and opaque resources |
 
-For example, grant HTTP on the host:
-
-```kotlin
-val services = WasmtimeHostServices(
-    http = WasmtimeHttpHandler { request ->
-        WasmtimeHttpResponse(
-            statusCode = 200,
-            body = myHttp(request),
-        )
-    },
-)
-```
-
-and use it in the extension:
-
-```kotlin
-val response = ExtensionHttp.get("https://api.example.com/items")
-```
-
-Storage is namespaced under `/extension`:
-
-```kotlin
-ExtensionStorage.prepare()
-val settings = ExtensionStorage.persistentPath("settings.json")
-val cache = ExtensionStorage.cachePath("feed.json")
-val temp = ExtensionStorage.temporaryPath("work.tmp")
-```
-
-Capabilities are declared by the extension, for example:
+Declare required capabilities in the extension:
 
 ```kotlin
 wasmtimeExtension {
@@ -238,11 +198,36 @@ wasmtimeExtension {
 }
 ```
 
-Loading fails early when a required capability has not been provided by the host.
+Provide them while loading:
+
+```kotlin
+val services = WasmtimeHostServices(
+    http = WasmtimeHttpHandler { request -> myHttp(request) },
+    storage = WasmtimeExtensionStorage("/my/extensions/example"),
+    logger = WasmtimeExtensionLogger { event -> println(event.message) },
+)
+```
+
+Loading fails early when a declared capability is missing.
+
+## Callbacks, streams, and Flow
+
+Serializable contract values cross the boundary by value. Stateful or executable objects use opaque resource handles instead. This is the mechanism for callbacks, pagers, feeds, iterators, and flows.
+
+Guest-owned resources are registered with `ExtensionRemoteResources` and wrapped by the host with `loaded.remoteResource(...)`, `remoteCallback(...)`, or `remoteStream(...)`.
+
+Host-owned resources are registered with `WasmtimeHostResourceRegistry` and exposed to the guest through `ExtensionHostResource`, `ExtensionHostCallback`, or `ExtensionHostStream`.
+
+```kotlin
+val resources = WasmtimeHostResourceRegistry()
+val services = WasmtimeHostServices(remoteResources = resources)
+
+val streamHandle = resources.registerFlow(scope, events)
+```
+
+Both stream directions support `Flow<ByteArray>` through `asFlow()`. Resource payloads are byte-level so applications can layer their own serializable DTOs on top.
 
 ## Lifecycle and errors
-
-Extensions can implement lifecycle hooks:
 
 ```kotlin
 object MyPlugin : Plugin, WasmtimeExtensionLifecycle {
@@ -251,13 +236,11 @@ object MyPlugin : Plugin, WasmtimeExtensionLifecycle {
 }
 ```
 
-Guest exceptions are surfaced as `WasmtimeExtensionException` with the remote type, message, and guest stack information when available.
+Use `loaded.shutdown()` to run `onUnload()` and release guest resources. Use `close()` only for immediate transport cleanup.
 
-Use `shutdown()` when you want the suspend `onUnload()` lifecycle to run. Use `close()` when you only need immediate transport cleanup.
+Guest failures become `WasmtimeExtensionException`. Suspend calls propagate cancellation through the extension ABI. A non-suspending contract member must also remain non-suspending inside Wasm; attempting to suspend from it fails the call.
 
-## Limits
-
-Use `WasmtimeLimits` to bound untrusted execution:
+## Execution limits
 
 ```kotlin
 val limits = WasmtimeLimits(
@@ -268,11 +251,38 @@ val limits = WasmtimeLimits(
 )
 ```
 
-Limits can be used with bundled extensions, manually loaded extensions, and the lower-level runtime APIs.
+Use limits when running untrusted modules or extensions.
 
-## Testing extensions
+## Platform notes
 
-`withWasmtimeExtension(...)` owns the transport lifecycle and lets tests provide fake host services:
+| Host | Support |
+| --- | --- |
+| Android ARM64 / x86_64 | Yes |
+| Linux x64 / ARM64 | Yes |
+| Windows x64 | Yes |
+| macOS x64 / ARM64 | Yes |
+| iOS ARM64 | Yes |
+| JVM on Linux x64 / ARM64 | Yes |
+| Browser / WasmJS | Yes |
+
+Browser/WasmJS keeps each typed extension in a persistent isolated Worker, so guest state and resource handles survive across calls. Worker messaging is asynchronous, so synchronous typed contract members (`fun`, `val`, and `var`) are not supported there; use `suspend` members for calls that cross the Wasm boundary. A hard execution timeout or cancellation terminates that worker session so CPU-bound Wasm cannot continue running in the background.
+
+A Browser/WasmJS host import called from a module start function also cannot inspect module-owned exported memory before instantiation has completed.
+
+### JVM on Linux
+
+JVM/Linux needs the API JAR and the matching native runtime:
+
+```kotlin
+implementation("dev.brahmkshatriya.wasmtime:lib-jvm:VERSION")
+runtimeOnly("dev.brahmkshatriya.wasmtime:lib-jvm:VERSION:linux-x64")
+```
+
+Use `linux-arm64` on ARM64. Kotlin/Native targets do not need this extra runtime dependency.
+
+## Testing
+
+`withWasmtimeExtension(...)` owns the transport lifecycle and accepts test host services:
 
 ```kotlin
 withWasmtimeExtension(
@@ -285,20 +295,22 @@ withWasmtimeExtension(
 }
 ```
 
-## JVM on Linux
-
-JVM/Linux needs the API JAR plus the native runtime for the machine running the app:
-
-```kotlin
-implementation("dev.brahmkshatriya.wasmtime:lib-jvm:VERSION")
-runtimeOnly("dev.brahmkshatriya.wasmtime:lib-jvm:VERSION:linux-x64")
-```
-
-Use the `linux-arm64` classifier on ARM64. Kotlin/Native targets do not need this extra runtime dependency.
-
 ## Demo
 
-The `demo` directory contains real extension/host examples for Android, Linux, JVM, and the browser. It explicitly uses `bundleExtension(...)` to demonstrate the optional automatic-packaging path.
+The `demo` directory contains working extension/host examples for Android, Linux, JVM, and Browser/WasmJS. Its public API is intentionally shaped like Echo's extension system: one root music client is composed from smaller client/provider capabilities instead of exposing one flat RPC interface.
+
+```kotlin
+interface MusicExtensionClient :
+    ExtensionClient,
+    HomeFeedClient,
+    TrackClient,
+    MessageFlowProvider,
+    DiagnosticsClient
+```
+
+Serializable metadata, tracks, tabs, shelves, settings DTOs, and pages cross the boundary as CBOR values. `Feed` carries an opaque guest-owned pager handle; the host reconstructs that as `RemoteFeed` and loads subsequent pages through the same persistent Wasm instance. Settings and the message channel are host-owned resources injected before `onInitialize()`, mirroring Echo's provider-injection lifecycle without trying to pass JVM `Settings` or `MutableSharedFlow` objects into Wasm.
+
+The two demo extensions also retain HTTP, persistent storage, host callbacks/flows, packaged resources, credentials, and structured failure checks so the example continues to exercise the lower-level runtime capabilities.
 
 ```shell
 ./gradlew :demo:apps:linux:linkDebugExecutableLinuxX64

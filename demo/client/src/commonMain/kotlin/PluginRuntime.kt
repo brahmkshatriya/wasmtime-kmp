@@ -1,23 +1,36 @@
+@file:OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+
 package dev.brahmkshatriya.wasmtime.demo
 
 import dev.brahmkshatriya.wasmtime.WasmtimeBundledExtension
 import dev.brahmkshatriya.wasmtime.WasmtimeCredentialProvider
-import dev.brahmkshatriya.wasmtime.WasmtimeExtensionLogger
 import dev.brahmkshatriya.wasmtime.WasmtimeExtensionException
+import dev.brahmkshatriya.wasmtime.WasmtimeExtensionLogger
 import dev.brahmkshatriya.wasmtime.WasmtimeExtensionStorage
+import dev.brahmkshatriya.wasmtime.WasmtimeHostResourceRegistry
 import dev.brahmkshatriya.wasmtime.WasmtimeHostServices
 import dev.brahmkshatriya.wasmtime.WasmtimeHttpHandler
 import dev.brahmkshatriya.wasmtime.WasmtimeHttpHeader
 import dev.brahmkshatriya.wasmtime.WasmtimeHttpResponse
 import dev.brahmkshatriya.wasmtime.WasmtimeLimits
 import dev.brahmkshatriya.wasmtime.WasmtimeLoadedExtension
+import dev.brahmkshatriya.wasmtime.WasmtimeRemoteCallback
 import dev.brahmkshatriya.wasmtime.WasmtimeResourceProvider
 import dev.brahmkshatriya.wasmtime.WasmtimeRuntime
 import dev.brahmkshatriya.wasmtime.asWasmtimeByteStream
 import dev.brahmkshatriya.wasmtime.demo.generated.resources.Res
-import dev.brahmkshatriya.wasmtime.demo.shared.Plugin
-import dev.brahmkshatriya.wasmtime.demo.shared.Product
-import dev.brahmkshatriya.wasmtime.generated.PluginWasmtimeProxy
+import dev.brahmkshatriya.wasmtime.demo.shared.ExtensionMessage
+import dev.brahmkshatriya.wasmtime.demo.shared.Feed
+import dev.brahmkshatriya.wasmtime.demo.shared.FeedPageRequest
+import dev.brahmkshatriya.wasmtime.demo.shared.MusicExtensionClient
+import dev.brahmkshatriya.wasmtime.demo.shared.Page
+import dev.brahmkshatriya.wasmtime.demo.shared.SettingsOperation
+import dev.brahmkshatriya.wasmtime.demo.shared.SettingsRequest
+import dev.brahmkshatriya.wasmtime.demo.shared.SettingsResponse
+import dev.brahmkshatriya.wasmtime.demo.shared.Shelf
+import dev.brahmkshatriya.wasmtime.demo.shared.Tab
+import dev.brahmkshatriya.wasmtime.demo.shared.Track
+import dev.brahmkshatriya.wasmtime.generated.MusicExtensionClientWasmtimeProxy
 import dev.brahmkshatriya.wasmtime.generated.WasmtimeBundledExtensions
 import dev.brahmkshatriya.wasmtime.load
 import dev.brahmkshatriya.wasmtime.loadWasmtimeBundledRuntime
@@ -28,7 +41,14 @@ import io.ktor.client.statement.bodyAsChannel
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
 import io.ktor.utils.io.readBuffer
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.io.readByteArray
+import kotlinx.serialization.cbor.Cbor
+import kotlinx.serialization.decodeFromByteArray
+import kotlinx.serialization.encodeToByteArray
+
+private val cbor = Cbor { ignoreUnknownKeys = true }
 
 data class DemoPlugin(
     val artifact: WasmtimeBundledExtension,
@@ -37,9 +57,12 @@ data class DemoPlugin(
     val name: String get() = artifact.name
 }
 
-data class LoadedProduct(
+data class LoadedHome(
     val plugin: DemoPlugin,
-    val product: Product,
+    val metadataName: String,
+    val description: String,
+    val shelves: List<Shelf>,
+    val messages: List<ExtensionMessage>,
 )
 
 val demoPlugins: List<DemoPlugin> = WasmtimeBundledExtensions.all.map(::DemoPlugin)
@@ -117,27 +140,109 @@ private val demoResources = WasmtimeResourceProvider { name ->
     if (name != "demo-resource") null
     else ByteArray(DEMO_RESOURCE_SIZE) { index -> (index * 31).toByte() }.asWasmtimeByteStream()
 }
+private val demoRemoteResources = WasmtimeHostResourceRegistry()
 
 private val demoLogger = WasmtimeExtensionLogger { event ->
     val prefix = event.extensionId?.let { "[$it] " }.orEmpty()
     println("wasmtime ${event.level}: $prefix${event.message}")
 }
 
-suspend fun loadPlugin(plugin: DemoPlugin, storageRoot: String): WasmtimeLoadedExtension<Plugin> =
-    plugin.artifact.load(
-        readResource = Res::readBytes,
-        runtime = loadPluginRuntime(),
-        services = WasmtimeHostServices(
-            http = demoHttpHandler(),
-            storage = WasmtimeExtensionStorage("$storageRoot/${plugin.id}"),
-            credentials = demoCredentials,
-            resources = demoResources,
-            logger = demoLogger,
-        ),
-        limits = limits,
-        expectedContract = PluginWasmtimeProxy.CONTRACT,
-        proxyFactory = ::PluginWasmtimeProxy,
+class DemoExtensionSession internal constructor(
+    val plugin: DemoPlugin,
+    private val loaded: WasmtimeLoadedExtension<MusicExtensionClient>,
+    private val settingsHandle: Long,
+    private val messageHandle: Long,
+    val messages: MutableList<ExtensionMessage>,
+) {
+    val api: MusicExtensionClient get() = loaded.api
+    val supportsPersistentResources: Boolean get() = loaded.supportsPersistentResources
+
+    suspend fun loadHomeFeed(): RemoteFeed {
+        val descriptor = api.loadHomeFeed()
+        return RemoteFeed(descriptor, loaded.remoteCallback(descriptor.pagerHandle))
+    }
+
+    suspend fun shutdown() {
+        try {
+            loaded.shutdown()
+        } finally {
+            demoRemoteResources.release(settingsHandle)
+            demoRemoteResources.release(messageHandle)
+        }
+    }
+}
+
+class RemoteFeed internal constructor(
+    val descriptor: Feed,
+    private val pager: WasmtimeRemoteCallback,
+) {
+    val tabs: List<Tab> get() = descriptor.tabs
+
+    suspend fun loadPage(tab: Tab?, continuation: String? = null): Page<Shelf> {
+        val request = FeedPageRequest(tabId = tab?.id, continuation = continuation)
+        return cbor.decodeFromByteArray(
+            pager.invoke(cbor.encodeToByteArray(request))
+        )
+    }
+
+    suspend fun close() {
+        pager.release()
+    }
+}
+
+suspend fun loadPlugin(plugin: DemoPlugin, storageRoot: String): DemoExtensionSession {
+    val settings = mutableMapOf(
+        "greeting" to "Host setting for ${plugin.name}",
     )
+    val messages = mutableListOf<ExtensionMessage>()
+    val settingsHandle = demoRemoteResources.registerCallback { payload ->
+        val request = cbor.decodeFromByteArray<SettingsRequest>(payload)
+        val response = when (request.operation) {
+            SettingsOperation.GetString -> SettingsResponse(
+                settings[request.key] ?: request.defaultValue
+            )
+            SettingsOperation.PutString -> {
+                settings[request.key] = requireNotNull(request.value) { "setting value is required" }
+                SettingsResponse(request.value)
+            }
+        }
+        cbor.encodeToByteArray(response)
+    }
+    val messageHandle = demoRemoteResources.registerCallback { payload ->
+        val message = cbor.decodeFromByteArray<ExtensionMessage>(payload)
+        messages += message
+        println("extension message [${plugin.id}]: ${message.text}")
+        ByteArray(0)
+    }
+
+    var loaded: WasmtimeLoadedExtension<MusicExtensionClient>? = null
+    try {
+        loaded = plugin.artifact.load(
+            readResource = Res::readBytes,
+            runtime = loadPluginRuntime(),
+            services = WasmtimeHostServices(
+                http = demoHttpHandler(),
+                storage = WasmtimeExtensionStorage("$storageRoot/${plugin.id}"),
+                credentials = demoCredentials,
+                resources = demoResources,
+                remoteResources = demoRemoteResources,
+                logger = demoLogger,
+            ),
+            limits = limits,
+            expectedContract = MusicExtensionClientWasmtimeProxy.CONTRACT,
+            proxyFactory = ::MusicExtensionClientWasmtimeProxy,
+        )
+        loaded.api.setSettings(settingsHandle)
+        loaded.api.setMessageFlow(messageHandle)
+        loaded.api.onInitialize()
+        return DemoExtensionSession(plugin, loaded, settingsHandle, messageHandle, messages)
+    } catch (failure: Throwable) {
+        loaded?.shutdown()
+        demoRemoteResources.release(settingsHandle)
+        demoRemoteResources.release(messageHandle)
+        throw failure
+    }
+}
 
 private suspend fun loadPluginRuntime(): WasmtimeRuntime {
     cachedPluginRuntime?.let { return it }
@@ -147,30 +252,95 @@ private suspend fun loadPluginRuntime(): WasmtimeRuntime {
     ).also { cachedPluginRuntime = it }
 }
 
+suspend fun loadHomePreview(plugin: DemoPlugin, storageRoot: String): LoadedHome {
+    val session = loadPlugin(plugin, storageRoot)
+    try {
+        session.api.onExtensionSelected()
+        val metadata = session.api.metadata()
+        val feed = session.loadHomeFeed()
+        try {
+            val tab = feed.tabs.firstOrNull()
+            val first = feed.loadPage(tab)
+            val second = first.continuation?.let { feed.loadPage(tab, it) }
+            return LoadedHome(
+                plugin = plugin,
+                metadataName = metadata.name,
+                description = metadata.description,
+                shelves = first.data + second?.data.orEmpty(),
+                messages = session.messages.toList(),
+            )
+        } finally {
+            feed.close()
+        }
+    } finally {
+        session.shutdown()
+    }
+}
+
 suspend fun runDemoExtensionSmoke(storageRoot: String) {
     for (plugin in demoPlugins) {
-        val loaded = loadPlugin(plugin, storageRoot)
+        val session = loadPlugin(plugin, storageRoot)
         try {
-            val productId = if (plugin.id == "plugin1") 1 else 2
-            val product = loaded.api.getProductDetails(productId)
-            check(product.id == productId) { "unexpected product id ${product.id}" }
+            val metadata = session.api.metadata()
+            check(metadata.id == plugin.id) { "unexpected extension id ${metadata.id}" }
+            check(session.api.getSettingItems().isNotEmpty()) { "settings provider returned no items" }
+            session.api.onExtensionSelected()
+            check(session.messages.size >= 2) { "message flow injection did not receive lifecycle messages" }
 
-            val streamedSize = loaded.api.readResourceSize("demo-resource")
+            check(session.supportsPersistentResources) { "demo backend must preserve guest resources" }
+            val feed = session.loadHomeFeed()
+            try {
+                val first = feed.loadPage(feed.tabs.first())
+                check(first.data.isNotEmpty()) { "home feed first page is empty" }
+                val continuation = checkNotNull(first.continuation) { "home feed did not expose a second page" }
+                val second = feed.loadPage(feed.tabs.first(), continuation)
+                check(second.data.isNotEmpty() && second.continuation == null) {
+                    "home feed second page is invalid"
+                }
+            } finally {
+                feed.close()
+            }
+
+            val trackId = if (plugin.id == "plugin1") 1 else 2
+            val track: Track = session.api.loadTrack(trackId)
+            check(track.id == trackId) { "unexpected track id ${track.id}" }
+
+            val hostCallback = demoRemoteResources.registerCallback { payload ->
+                "host:${payload.decodeToString()}".encodeToByteArray()
+            }
+            check(session.api.invokeHostCallback(hostCallback, "callback") == "host:callback") {
+                "host callback resource failed"
+            }
+
+            coroutineScope {
+                val hostStream = demoRemoteResources.registerFlow(
+                    scope = this,
+                    flow = flowOf(byteArrayOf(1, 2), byteArrayOf(3, 4)),
+                )
+                check(session.api.sumHostStream(hostStream) == 10) {
+                    "host Flow resource failed"
+                }
+            }
+
+            val streamedSize = session.api.readResourceSize("demo-resource")
             check(streamedSize == DEMO_RESOURCE_SIZE) {
                 "streamed resource size mismatch: $streamedSize != $DEMO_RESOURCE_SIZE"
             }
-            check(loaded.api.credentialAvailable()) { "host-owned credential was not injected" }
+            check(session.api.credentialAvailable()) { "host-owned credential was not injected" }
 
-            val failure = runCatching { loaded.api.failForTest() }.exceptionOrNull()
+            val failure = runCatching { session.api.failForTest() }.exceptionOrNull()
             check(failure is WasmtimeExtensionException) {
                 "expected structured WasmtimeExtensionException, got ${failure?.let { it::class.simpleName }}"
             }
             check(failure.remoteType.contains("IllegalArgumentException")) {
                 "unexpected remote failure type: ${failure.remoteType}"
             }
-            println("extension_smoke=${plugin.id}:ok product=${product.id} streamed=$streamedSize")
+            println(
+                "extension_smoke=${plugin.id}:ok track=${track.id} " +
+                    "messages=${session.messages.size} streamed=$streamedSize"
+            )
         } finally {
-            loaded.shutdown()
+            session.shutdown()
         }
     }
 }

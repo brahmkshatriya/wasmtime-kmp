@@ -1,7 +1,10 @@
 package dev.brahmkshatriya.wasmtime
 
+import dev.brahmkshatriya.wasmtime.internal.JniHostImportsBridge
 import dev.brahmkshatriya.wasmtime.internal.JniHttpHandlerBridge
 import dev.brahmkshatriya.wasmtime.internal.NativeWasmtime
+import dev.brahmkshatriya.wasmtime.internal.toBits
+import dev.brahmkshatriya.wasmtime.internal.toWasmValue
 import kotlinx.coroutines.yield
 
 internal actual fun createPlatformWasmtimeModule(
@@ -14,51 +17,41 @@ internal actual fun createPlatformWasmtimeInstance(
     httpHandler: WasmtimeHttpHandler?,
     storage: WasmtimeStorage?,
     runtime: WasmtimeRuntime?,
+    imports: WasmtimeImports,
 ): PlatformWasmtimeInstance {
-    val bridge = httpHandler?.let { JniHttpHandlerBridge(it, limits.maxHttpResponseBytes) }
-    val handle = if (runtime == null) {
-        NativeWasmtime.nativeLoad(
-            wasm,
-            limits.maxMemoryBytes,
-            limits.fuel,
-            limits.maxExecutionMillis,
-            limits.maxTableElements,
-            limits.maxHostCallBytes,
-            limits.maxOutputBytes,
-            limits.maxHttpResponseBytes,
-            limits.maxWasiPollMillis,
-            bridge,
-            storage?.backingPath,
-            storage?.guestPath,
-            storage?.readOnly ?: false,
-            storage?.maxBytes ?: 0L,
-            storage?.maxEntries ?: 0,
-            storage?.maxFileBytes ?: 0L,
-        )
-    } else {
-        NativeWasmtime.nativeLoadWithRuntime(
-            wasm,
-            runtime.modules.map { it.name }.toTypedArray(),
-            runtime.modules.map { it.wasm }.toTypedArray(),
-            limits.maxMemoryBytes,
-            limits.fuel,
-            limits.maxExecutionMillis,
-            limits.maxTableElements,
-            limits.maxHostCallBytes,
-            limits.maxOutputBytes,
-            limits.maxHttpResponseBytes,
-            limits.maxWasiPollMillis,
-            bridge,
-            storage?.backingPath,
-            storage?.guestPath,
-            storage?.readOnly ?: false,
-            storage?.maxBytes ?: 0L,
-            storage?.maxEntries ?: 0,
-            storage?.maxFileBytes ?: 0L,
-        )
-    }
-    return JniWasmtimeInstance(handle, bridge)
+    val httpBridge = httpHandler?.let { JniHttpHandlerBridge(it, limits.maxHttpResponseBytes) }
+    val runtimeModules = runtime?.modules.orEmpty()
+    val functions = imports.functions
+    val handle = NativeWasmtime.nativeLoadWithRuntimeAndImports(
+        wasm,
+        runtimeModules.map { it.name }.toTypedArray(),
+        runtimeModules.map { it.wasm }.toTypedArray(),
+        functions.map { it.module }.toTypedArray(),
+        functions.map { it.name }.toTypedArray(),
+        functions.map { it.type.parameters.toKindArray() }.toTypedArray(),
+        functions.map { it.type.results.toKindArray() }.toTypedArray(),
+        imports.takeIf { functions.isNotEmpty() }?.let(::JniHostImportsBridge),
+        limits.maxMemoryBytes,
+        limits.fuel,
+        limits.maxExecutionMillis,
+        limits.maxTableElements,
+        limits.maxHostCallBytes,
+        limits.maxOutputBytes,
+        limits.maxHttpResponseBytes,
+        limits.maxWasiPollMillis,
+        httpBridge,
+        storage?.backingPath,
+        storage?.guestPath,
+        storage?.readOnly ?: false,
+        storage?.maxBytes ?: 0L,
+        storage?.maxEntries ?: 0,
+        storage?.maxFileBytes ?: 0L,
+    )
+    return JniWasmtimeInstance(handle, httpBridge)
 }
+
+private fun List<WasmValueType>.toKindArray(): IntArray =
+    IntArray(size) { index -> this[index].ordinal }
 
 private class JniHandle(initial: Long) {
     private var value: Long = initial
@@ -86,50 +79,37 @@ private class JniWasmtimeModule(
         httpHandler: WasmtimeHttpHandler?,
         storage: WasmtimeStorage?,
         runtime: WasmtimeRuntime?,
+        imports: WasmtimeImports,
     ): PlatformWasmtimeInstance = handle.withOpen { current ->
-        val bridge = httpHandler?.let { JniHttpHandlerBridge(it, limits.maxHttpResponseBytes) }
-        val instance = if (runtime == null) {
-            NativeWasmtime.nativeInstantiate(
-                current,
-                limits.maxMemoryBytes,
-                limits.fuel,
-                limits.maxExecutionMillis,
-                limits.maxTableElements,
-                limits.maxHostCallBytes,
-                limits.maxOutputBytes,
-                limits.maxHttpResponseBytes,
-                limits.maxWasiPollMillis,
-                bridge,
-                storage?.backingPath,
-                storage?.guestPath,
-                storage?.readOnly ?: false,
-                storage?.maxBytes ?: 0L,
-                storage?.maxEntries ?: 0,
-                storage?.maxFileBytes ?: 0L,
-            )
-        } else {
-            NativeWasmtime.nativeInstantiateWithRuntime(
-                current,
-                runtime.modules.map { it.name }.toTypedArray(),
-                runtime.modules.map { it.wasm }.toTypedArray(),
-                limits.maxMemoryBytes,
-                limits.fuel,
-                limits.maxExecutionMillis,
-                limits.maxTableElements,
-                limits.maxHostCallBytes,
-                limits.maxOutputBytes,
-                limits.maxHttpResponseBytes,
-                limits.maxWasiPollMillis,
-                bridge,
-                storage?.backingPath,
-                storage?.guestPath,
-                storage?.readOnly ?: false,
-                storage?.maxBytes ?: 0L,
-                storage?.maxEntries ?: 0,
-                storage?.maxFileBytes ?: 0L,
-            )
-        }
-        JniWasmtimeInstance(instance, bridge)
+        val httpBridge = httpHandler?.let { JniHttpHandlerBridge(it, limits.maxHttpResponseBytes) }
+        val runtimeModules = runtime?.modules.orEmpty()
+        val functions = imports.functions
+        val instance = NativeWasmtime.nativeInstantiateWithRuntimeAndImports(
+            current,
+            runtimeModules.map { it.name }.toTypedArray(),
+            runtimeModules.map { it.wasm }.toTypedArray(),
+            functions.map { it.module }.toTypedArray(),
+            functions.map { it.name }.toTypedArray(),
+            functions.map { it.type.parameters.toKindArray() }.toTypedArray(),
+            functions.map { it.type.results.toKindArray() }.toTypedArray(),
+            imports.takeIf { functions.isNotEmpty() }?.let(::JniHostImportsBridge),
+            limits.maxMemoryBytes,
+            limits.fuel,
+            limits.maxExecutionMillis,
+            limits.maxTableElements,
+            limits.maxHostCallBytes,
+            limits.maxOutputBytes,
+            limits.maxHttpResponseBytes,
+            limits.maxWasiPollMillis,
+            httpBridge,
+            storage?.backingPath,
+            storage?.guestPath,
+            storage?.readOnly ?: false,
+            storage?.maxBytes ?: 0L,
+            storage?.maxEntries ?: 0,
+            storage?.maxFileBytes ?: 0L,
+        )
+        JniWasmtimeInstance(instance, httpBridge)
     }
 
     override fun close() = handle.close(NativeWasmtime::nativeModuleClose)
@@ -149,7 +129,65 @@ private class JniWasmtimeInstance(
             )
         }
 
+    override fun resolveFunction(
+        exportName: String,
+        type: WasmtimeFunctionType,
+    ): PlatformWasmtimeFunction = handle.withOpen { current ->
+        JniWasmtimeFunction(
+            handle = NativeWasmtime.nativeResolveFunction(
+                current,
+                exportName,
+                type.parameters.toKindArray(),
+                type.results.toKindArray(),
+            ),
+            type = type,
+        )
+    }
+
+    override fun resolveMemory(exportName: String): PlatformWasmtimeMemory =
+        JniWasmtimeMemory(handle, exportName).also { it.size() }
+
     override fun close() = handle.close(NativeWasmtime::nativeClose)
+}
+
+private class JniWasmtimeFunction(
+    handle: Long,
+    private val type: WasmtimeFunctionType,
+) : PlatformWasmtimeFunction {
+    private val handle = JniHandle(handle)
+
+    override fun call(arguments: List<WasmValue>): List<WasmValue> =
+        handle.withOpen { current ->
+            val resultBits = NativeWasmtime.nativeCallResolvedFunction(
+                current,
+                arguments.map(WasmValue::toBits).toLongArray(),
+            )
+            require(resultBits.size == type.results.size) { "Wasm result count mismatch" }
+            type.results.mapIndexed { index, resultType ->
+                resultBits[index].toWasmValue(resultType)
+            }
+        }
+
+    override fun close() = handle.close(NativeWasmtime::nativeGenericFunctionClose)
+}
+
+private class JniWasmtimeMemory(
+    private val instance: JniHandle,
+    private val exportName: String,
+) : PlatformWasmtimeMemory {
+    override fun size(): Int = instance.withOpen { current ->
+        NativeWasmtime.nativeMemorySize(current, exportName)
+    }
+
+    override fun read(offset: Int, length: Int): ByteArray = instance.withOpen { current ->
+        NativeWasmtime.nativeMemoryRead(current, exportName, offset, length)
+    }
+
+    override fun write(offset: Int, bytes: ByteArray) {
+        instance.withOpen { current ->
+            NativeWasmtime.nativeMemoryWrite(current, exportName, offset, bytes)
+        }
+    }
 }
 
 private class JniWasmtimeI32Function(
@@ -180,4 +218,3 @@ private class JniWasmtimeI32Function(
 
     override fun close() = handle.close(NativeWasmtime::nativeFunctionClose)
 }
-

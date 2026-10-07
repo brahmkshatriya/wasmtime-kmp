@@ -11,10 +11,10 @@ wasmtime {
 }
 
 wasmtimeExtension {
-    contractInterface.set("dev.brahmkshatriya.wasmtime.demo.shared.Plugin")
-    implementationClass.set("dev.brahmkshatriya.wasmtime.demo.plugin2.ProductPlugin")
-    displayName.set("Product Plugin 2")
-    capabilities("Http", "PersistentStorage", "Credentials", "Logging", "Streaming")
+    contractInterface.set("dev.brahmkshatriya.wasmtime.demo.shared.MusicExtensionClient")
+    implementationClass.set("dev.brahmkshatriya.wasmtime.demo.plugin2.MusicPlugin")
+    displayName.set("Echo-style Music 2")
+    capabilities("Http", "PersistentStorage", "Credentials", "Logging", "Streaming", "HostResources")
     compileOnlyDependencies {
         useExtensionApi("demo")
     }

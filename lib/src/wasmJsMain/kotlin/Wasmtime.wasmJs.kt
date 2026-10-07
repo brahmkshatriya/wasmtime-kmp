@@ -15,6 +15,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 internal actual fun createPlatformWasmtimeModule(
     wasm: ByteArray,
@@ -26,8 +28,9 @@ internal actual fun createPlatformWasmtimeInstance(
     httpHandler: WasmtimeHttpHandler?,
     storage: WasmtimeStorage?,
     runtime: WasmtimeRuntime?,
+    imports: WasmtimeImports,
 ): PlatformWasmtimeInstance = WasmJsWasmtimeModule(jsCompileModule(wasm.toJsUint8Array()))
-    .instantiate(limits, httpHandler, storage, runtime)
+    .instantiate(limits, httpHandler, storage, runtime, imports)
 
 
 internal actual fun createPlatformWasmtimeExtensionTransport(
@@ -49,42 +52,48 @@ internal actual fun createPlatformWasmtimeExtensionTransport(
             null
         }
     }
+    val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    val session = jsCreateExtensionWorker(
+        instantiateSource = WASM_JS_HOST_SOURCE,
+        wasm = wasm.toJsUint8Array(),
+        runtimeModules = runtime.toJsRuntimeModules(),
+        storagePath = storage?.backingPath ?: "",
+        guestPath = storage?.guestPath ?: "/data",
+        storageReadOnly = storage?.readOnly ?: true,
+        maxMemoryBytes = limits.maxMemoryBytes.toDouble(),
+        maxTableElements = limits.maxTableElements.toDouble(),
+        maxModuleBytes = limits.maxModuleBytes,
+        maxHostCallBytes = limits.maxHostCallBytes,
+        maxOutputBytes = limits.maxOutputBytes.toDouble(),
+        maxWasiPollMillis = limits.maxWasiPollMillis.toDouble(),
+        storageMaxBytes = storage?.maxBytes?.toDouble() ?: 0.0,
+        storageMaxEntries = storage?.maxEntries ?: 0,
+        storageMaxFileBytes = storage?.maxFileBytes?.toDouble() ?: 0.0,
+    ) { metadata, body ->
+        workerHttpPromise(scope, httpHandler, limits, metadata, body)
+    }
+    val gate = Mutex()
     return object : WasmtimeExtensionTransport {
-        override suspend fun invoke(methodId: Int, arguments: ByteArray): ByteArray {
-        require(maxArgumentBytes == 0 || arguments.size <= maxArgumentBytes) {
-            "extension argument payload is too large: ${arguments.size} > $maxArgumentBytes bytes"
-        }
-        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        val task = jsRunExtensionWorker(
-            instantiateSource = WASM_JS_HOST_SOURCE,
-            wasm = wasm.toJsUint8Array(),
-            runtimeModules = runtime.toJsRuntimeModules(),
-            storagePath = storage?.backingPath ?: "",
-            guestPath = storage?.guestPath ?: "/data",
-            storageReadOnly = storage?.readOnly ?: true,
-            maxMemoryBytes = limits.maxMemoryBytes.toDouble(),
-            maxTableElements = limits.maxTableElements.toDouble(),
-            maxModuleBytes = limits.maxModuleBytes,
-            maxHostCallBytes = limits.maxHostCallBytes,
-            maxOutputBytes = limits.maxOutputBytes.toDouble(),
-            maxWasiPollMillis = limits.maxWasiPollMillis.toDouble(),
-            storageMaxBytes = storage?.maxBytes?.toDouble() ?: 0.0,
-            storageMaxEntries = storage?.maxEntries ?: 0,
-            storageMaxFileBytes = storage?.maxFileBytes?.toDouble() ?: 0.0,
-            maxExecutionMillis = limits.maxExecutionMillis.toDouble(),
-            methodId = methodId,
-            arguments = arguments.toJsUint8Array(),
-            maxArgumentBytes = maxArgumentBytes,
-            maxResultBytes = maxResultBytes,
-        ) { metadata, body ->
-            workerHttpPromise(scope, httpHandler, limits, metadata, body)
-        }
-        return try {
+        override val supportsPersistentResources: Boolean = true
+
+        override suspend fun invoke(methodId: Int, arguments: ByteArray): ByteArray = gate.withLock {
+            require(maxArgumentBytes == 0 || arguments.size <= maxArgumentBytes) {
+                "extension argument payload is too large: ${arguments.size} > $maxArgumentBytes bytes"
+            }
+            val task = jsInvokeExtensionWorker(
+                session = session,
+                methodId = methodId,
+                arguments = arguments.toJsUint8Array(),
+                maxArgumentBytes = maxArgumentBytes,
+                maxResultBytes = maxResultBytes,
+                maxExecutionMillis = limits.maxExecutionMillis.toDouble(),
+            )
             task.awaitWorkerBytes()
-        } finally {
-            scope.cancel()
-            jsCancelExtensionWorkerTask(task)
         }
+
+        override fun close() {
+            scope.cancel()
+            jsCloseExtensionWorker(session)
         }
     }
 }
@@ -160,9 +169,10 @@ private class WasmJsWasmtimeModule(
         httpHandler: WasmtimeHttpHandler?,
         storage: WasmtimeStorage?,
         runtime: WasmtimeRuntime?,
+        imports: WasmtimeImports,
     ): PlatformWasmtimeInstance {
         val current = checkNotNull(module) { "Wasmtime module is closed" }
-        return WasmJsWasmtimeInstance(current, limits, httpHandler, storage, runtime)
+        return WasmJsWasmtimeInstance(current, limits, httpHandler, storage, runtime, imports)
     }
 
     override fun close() {
@@ -176,23 +186,30 @@ private class WasmJsWasmtimeInstance(
     private val httpHandler: WasmtimeHttpHandler?,
     storage: WasmtimeStorage?,
     linkedRuntime: WasmtimeRuntime?,
+    private val imports: WasmtimeImports,
 ) : PlatformWasmtimeInstance {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val customImports: JsAny = imports.toJsHostImports()
     private var runtime: JsAny? = jsInstantiateModule(
-        module,
-        linkedRuntime.toJsRuntimeModules(),
-        storage?.backingPath ?: "",
-        storage?.guestPath ?: "/data",
-        storage?.readOnly ?: true,
-        limits.maxHostCallBytes,
-        limits.maxOutputBytes.toDouble(),
-        limits.maxWasiPollMillis.toDouble(),
-        storage?.maxBytes?.toDouble() ?: 0.0,
-        storage?.maxEntries ?: 0,
-        storage?.maxFileBytes?.toDouble() ?: 0.0,
-    ) { metadata, body ->
-        executeHttp(metadata, body)
-    }
+        module = module,
+        runtimeModules = linkedRuntime.toJsRuntimeModules(),
+        customImports = customImports,
+        storagePath = storage?.backingPath ?: "",
+        guestPath = storage?.guestPath ?: "/data",
+        storageReadOnly = storage?.readOnly ?: true,
+        maxHostCallBytes = limits.maxHostCallBytes,
+        maxOutputBytes = limits.maxOutputBytes.toDouble(),
+        maxWasiPollMillis = limits.maxWasiPollMillis.toDouble(),
+        storageMaxBytes = storage?.maxBytes?.toDouble() ?: 0.0,
+        storageMaxEntries = storage?.maxEntries ?: 0,
+        storageMaxFileBytes = storage?.maxFileBytes?.toDouble() ?: 0.0,
+        invokeHost = { index, encodedArguments ->
+            invokeHostImport(index, encodedArguments)
+        },
+        executeHttp = { metadata, body ->
+            executeHttp(metadata, body)
+        },
+    )
 
     init {
         checkMemoryLimit()
@@ -203,6 +220,22 @@ private class WasmJsWasmtimeInstance(
         val function = jsGetExportedFunction(current, exportName)
             ?: error("export not found: $exportName")
         return WasmJsWasmtimeI32Function(this, function)
+    }
+
+    override fun resolveFunction(
+        exportName: String,
+        type: WasmtimeFunctionType,
+    ): PlatformWasmtimeFunction {
+        val current = checkNotNull(runtime) { "Wasmtime instance is closed" }
+        val function = jsGetExportedFunction(current, exportName)
+            ?: error("export not found: $exportName")
+        return WasmJsWasmtimeFunction(this, function, type)
+    }
+
+    override fun resolveMemory(exportName: String): PlatformWasmtimeMemory {
+        val current = checkNotNull(runtime) { "Wasmtime instance is closed" }
+        jsExportMemorySize(current, exportName)
+        return WasmJsWasmtimeMemory(this, exportName)
     }
 
     override fun close() {
@@ -223,6 +256,59 @@ private class WasmJsWasmtimeInstance(
         val result = jsCallI32Async(function, first, second).awaitInt()
         checkMemoryLimit()
         return result
+    }
+
+    fun callGeneric(
+        function: JsAny,
+        type: WasmtimeFunctionType,
+        arguments: List<WasmValue>,
+    ): List<WasmValue> {
+        checkNotNull(runtime) { "Wasmtime instance is closed" }
+        val encoded = jsCallGeneric(
+            function,
+            type.parameters.toKindString(),
+            type.results.toKindString(),
+            arguments.encodeWasmValues(),
+        )
+        checkMemoryLimit()
+        return decodeWasmValues(encoded, type.results)
+    }
+
+    fun memorySize(exportName: String): Int =
+        jsExportMemorySize(checkNotNull(runtime) { "Wasmtime instance is closed" }, exportName)
+
+    fun memoryRead(exportName: String, offset: Int, length: Int): ByteArray =
+        jsExportMemoryRead(
+            checkNotNull(runtime) { "Wasmtime instance is closed" },
+            exportName,
+            offset,
+            length,
+        ).toKotlinByteArray()
+
+    fun memoryWrite(exportName: String, offset: Int, bytes: ByteArray) {
+        jsExportMemoryWrite(
+            checkNotNull(runtime) { "Wasmtime instance is closed" },
+            exportName,
+            offset,
+            bytes.toJsUint8Array(),
+        )
+    }
+
+    private fun invokeHostImport(index: Int, encodedArguments: String): String {
+        val function = imports.functions[index]
+        val arguments = decodeWasmValues(encodedArguments, function.type.parameters)
+        val memory = WasmtimeCallerMemory(
+            readBlock = { exportName, offset, length ->
+                memoryRead(exportName, offset, length)
+            },
+            writeBlock = { exportName, offset, bytes ->
+                memoryWrite(exportName, offset, bytes)
+            },
+            sizeBlock = { exportName -> memorySize(exportName) },
+        )
+        val results = function.callback.invoke(WasmtimeHostCall(arguments, memory))
+        validateWasmValues(results, function.type.results, "host import result")
+        return results.encodeWasmValues()
     }
 
     private fun checkMemoryLimit() {
@@ -265,6 +351,36 @@ private class WasmJsWasmtimeInstance(
         }
 }
 
+private class WasmJsWasmtimeFunction(
+    private val instance: WasmJsWasmtimeInstance,
+    private var function: JsAny?,
+    private val type: WasmtimeFunctionType,
+) : PlatformWasmtimeFunction {
+    override fun call(arguments: List<WasmValue>): List<WasmValue> =
+        instance.callGeneric(
+            checkNotNull(function) { "Wasmtime function is closed" },
+            type,
+            arguments,
+        )
+
+    override fun close() {
+        function = null
+    }
+}
+
+private class WasmJsWasmtimeMemory(
+    private val instance: WasmJsWasmtimeInstance,
+    private val exportName: String,
+) : PlatformWasmtimeMemory {
+    override fun size(): Int = instance.memorySize(exportName)
+
+    override fun read(offset: Int, length: Int): ByteArray =
+        instance.memoryRead(exportName, offset, length)
+
+    override fun write(offset: Int, bytes: ByteArray) =
+        instance.memoryWrite(exportName, offset, bytes)
+}
+
 private class WasmJsWasmtimeI32Function(
     private val instance: WasmJsWasmtimeInstance,
     private var function: JsAny?,
@@ -279,6 +395,57 @@ private class WasmJsWasmtimeI32Function(
         function = null
     }
 }
+
+private fun List<WasmValueType>.toKindString(): String =
+    joinToString(",") { it.ordinal.toString() }
+
+private fun List<WasmValue>.encodeWasmValues(): String =
+    joinToString(",") { value ->
+        val bits = when (value) {
+            is WasmValue.I32 -> value.value.toUInt().toULong()
+            is WasmValue.I64 -> value.value.toULong()
+            is WasmValue.F32 -> value.value.toBits().toUInt().toULong()
+            is WasmValue.F64 -> value.value.toBits().toULong()
+        }
+        bits.toString(16)
+    }
+
+private fun decodeWasmValues(
+    encoded: String,
+    types: List<WasmValueType>,
+): List<WasmValue> {
+    if (types.isEmpty()) {
+        require(encoded.isEmpty()) { "Wasm returned unexpected scalar values" }
+        return emptyList()
+    }
+    val values = encoded.split(',')
+    require(values.size == types.size) {
+        "Wasm result count mismatch: expected ${types.size}, got ${values.size}"
+    }
+    return types.mapIndexed { index, type ->
+        val bits = values[index].toULong(16)
+        when (type) {
+            WasmValueType.I32 -> WasmValue.I32(bits.toInt())
+            WasmValueType.I64 -> WasmValue.I64(bits.toLong())
+            WasmValueType.F32 -> WasmValue.F32(Float.fromBits(bits.toInt()))
+            WasmValueType.F64 -> WasmValue.F64(Double.fromBits(bits.toLong()))
+        }
+    }
+}
+
+private fun WasmtimeImports.toJsHostImports(): JsAny =
+    jsNewArray().also { array ->
+        functions.forEachIndexed { index, function ->
+            jsPushHostImport(
+                array,
+                function.module,
+                function.name,
+                function.type.parameters.toKindString(),
+                function.type.results.toKindString(),
+                index,
+            )
+        }
+    }
 
 private fun ByteArray.toJsUint8Array(): JsAny {
     val array = jsNewUint8Array(size)
@@ -328,7 +495,7 @@ private external fun jsGetUint8(array: JsAny, index: Int): Int
 @JsFun("(bytes) => new WebAssembly.Module(bytes)")
 private external fun jsCompileModule(bytes: JsAny): JsAny
 
-private const val WASM_JS_HOST_SOURCE: String = """(module, runtimeModules, storagePath, guestPath, storageReadOnly, maxHostCallBytes, maxOutputBytes, maxWasiPollMillis, storageMaxBytes, storageMaxEntries, storageMaxFileBytes, executeHttp) => {
+private const val WASM_JS_HOST_SOURCE: String = """(module, runtimeModules, customImports, storagePath, guestPath, storageReadOnly, maxHostCallBytes, maxOutputBytes, maxWasiPollMillis, storageMaxBytes, storageMaxEntries, storageMaxFileBytes, invokeHost, executeHttp) => {
         const rt = {
             instance: null,
             reqMeta: null,
@@ -850,6 +1017,64 @@ private const val WASM_JS_HOST_SOURCE: String = """(module, runtimeModules, stor
                 request_close,
             },
         };
+        const scalarBuffer = new ArrayBuffer(8);
+        const scalarView = new DataView(scalarBuffer);
+        const parseKinds = (csv) => csv.length === 0 ? [] : csv.split(',').map(Number);
+        const scalarToBits = (kind, value) => {
+            switch (kind) {
+                case 0: return BigInt.asUintN(32, BigInt(value | 0)).toString(16);
+                case 1: return BigInt.asUintN(64, value).toString(16);
+                case 2:
+                    scalarView.setFloat32(0, value, true);
+                    return scalarView.getUint32(0, true).toString(16);
+                case 3:
+                    scalarView.setFloat64(0, value, true);
+                    return scalarView.getBigUint64(0, true).toString(16);
+                default: throw new Error('unsupported Wasm scalar type');
+            }
+        };
+        const bitsToScalar = (kind, encoded) => {
+            const bits = BigInt('0x' + (encoded.length === 0 ? '0' : encoded));
+            switch (kind) {
+                case 0: return Number(BigInt.asIntN(32, bits));
+                case 1: return BigInt.asIntN(64, bits);
+                case 2:
+                    scalarView.setUint32(0, Number(BigInt.asUintN(32, bits)), true);
+                    return scalarView.getFloat32(0, true);
+                case 3:
+                    scalarView.setBigUint64(0, BigInt.asUintN(64, bits), true);
+                    return scalarView.getFloat64(0, true);
+                default: throw new Error('unsupported Wasm scalar type');
+            }
+        };
+        for (const spec of customImports) {
+            const params = parseKinds(spec.params);
+            const results = parseKinds(spec.results);
+            if (!imports[spec.module]) imports[spec.module] = {};
+            if (imports[spec.module][spec.name] !== undefined) {
+                throw new Error('duplicate host import: ' + spec.module + '.' + spec.name);
+            }
+            imports[spec.module][spec.name] = (...args) => {
+                if (args.length !== params.length) {
+                    throw new Error('host import argument count mismatch');
+                }
+                const encodedArgs = args.map((value, index) =>
+                    scalarToBits(params[index], value)
+                ).join(',');
+                const encodedResults = invokeHost(spec.index, encodedArgs);
+                const tokens = results.length === 0 ? [] : encodedResults.split(',');
+                if (tokens.length !== results.length) {
+                    throw new Error('host import result count mismatch');
+                }
+                const values = results.map((kind, index) =>
+                    bitsToScalar(kind, tokens[index])
+                );
+                if (values.length === 0) return undefined;
+                if (values.length === 1) return values[0];
+                return values;
+            };
+        }
+
         for (const linked of runtimeModules) {
             const linkedModule = new WebAssembly.Module(linked.bytes);
             const linkedInstance = new WebAssembly.Instance(linkedModule, imports);
@@ -874,6 +1099,7 @@ private const val WASM_JS_HOST_SOURCE: String = """(module, runtimeModules, stor
 private external fun jsInstantiateModule(
     module: JsAny,
     runtimeModules: JsAny,
+    customImports: JsAny,
     storagePath: String,
     guestPath: String,
     storageReadOnly: Boolean,
@@ -883,6 +1109,7 @@ private external fun jsInstantiateModule(
     storageMaxBytes: Double,
     storageMaxEntries: Int,
     storageMaxFileBytes: Double,
+    invokeHost: (Int, String) -> String,
     executeHttp: (JsAny, JsAny) -> Promise<JsAny>,
 ): JsAny
 
@@ -891,6 +1118,94 @@ private external fun jsGetExportedFunction(runtime: JsAny, name: String): JsAny?
 
 @JsFun("(fn, first, second) => fn(first, second) | 0")
 private external fun jsCallI32(fn: JsAny, first: Int, second: Int): Int
+
+
+@JsFun("""(fn, parameterKinds, resultKinds, encodedArguments) => {
+    const parseKinds = (csv) => csv.length === 0 ? [] : csv.split(',').map(Number);
+    const params = parseKinds(parameterKinds);
+    const results = parseKinds(resultKinds);
+    const tokens = params.length === 0 ? [] : encodedArguments.split(',');
+    if (tokens.length !== params.length) throw new Error('Wasm argument count mismatch');
+
+    const buffer = new ArrayBuffer(8);
+    const view = new DataView(buffer);
+    const fromBits = (kind, encoded) => {
+        const bits = BigInt('0x' + (encoded.length === 0 ? '0' : encoded));
+        switch (kind) {
+            case 0: return Number(BigInt.asIntN(32, bits));
+            case 1: return BigInt.asIntN(64, bits);
+            case 2:
+                view.setUint32(0, Number(BigInt.asUintN(32, bits)), true);
+                return view.getFloat32(0, true);
+            case 3:
+                view.setBigUint64(0, BigInt.asUintN(64, bits), true);
+                return view.getFloat64(0, true);
+            default: throw new Error('unsupported Wasm scalar type');
+        }
+    };
+    const toBits = (kind, value) => {
+        switch (kind) {
+            case 0: return BigInt.asUintN(32, BigInt(value | 0)).toString(16);
+            case 1: return BigInt.asUintN(64, value).toString(16);
+            case 2:
+                view.setFloat32(0, value, true);
+                return view.getUint32(0, true).toString(16);
+            case 3:
+                view.setFloat64(0, value, true);
+                return view.getBigUint64(0, true).toString(16);
+            default: throw new Error('unsupported Wasm scalar type');
+        }
+    };
+
+    const args = params.map((kind, index) => fromBits(kind, tokens[index]));
+    const raw = fn(...args);
+    const values = results.length === 0 ? [] : (results.length === 1 ? [raw] : raw);
+    if (values.length !== results.length) throw new Error('Wasm result count mismatch');
+    return values.map((value, index) => toBits(results[index], value)).join(',');
+}""")
+private external fun jsCallGeneric(
+    fn: JsAny,
+    parameterKinds: String,
+    resultKinds: String,
+    encodedArguments: String,
+): String
+
+@JsFun("""(runtime, name) => {
+    const memory = runtime.instance.exports[name];
+    if (!(memory instanceof WebAssembly.Memory)) throw new Error('memory export not found: ' + name);
+    return memory.buffer.byteLength;
+}""")
+private external fun jsExportMemorySize(runtime: JsAny, name: String): Int
+
+@JsFun("""(runtime, name, offset, length) => {
+    const memory = runtime.instance.exports[name];
+    if (!(memory instanceof WebAssembly.Memory)) throw new Error('memory export not found: ' + name);
+    if (offset < 0 || length < 0 || offset + length > memory.buffer.byteLength) {
+        throw new Error('memory range is out of bounds');
+    }
+    return new Uint8Array(memory.buffer, offset, length).slice();
+}""")
+private external fun jsExportMemoryRead(
+    runtime: JsAny,
+    name: String,
+    offset: Int,
+    length: Int,
+): JsAny
+
+@JsFun("""(runtime, name, offset, bytes) => {
+    const memory = runtime.instance.exports[name];
+    if (!(memory instanceof WebAssembly.Memory)) throw new Error('memory export not found: ' + name);
+    if (offset < 0 || offset + bytes.length > memory.buffer.byteLength) {
+        throw new Error('memory range is out of bounds');
+    }
+    new Uint8Array(memory.buffer, offset, bytes.length).set(bytes);
+}""")
+private external fun jsExportMemoryWrite(
+    runtime: JsAny,
+    name: String,
+    offset: Int,
+    bytes: JsAny,
+)
 
 @JsFun("""(fn, first, second) => {
     try {
@@ -914,13 +1229,14 @@ private external fun jsIsBrowser(): Boolean
 @JsFun(
     """(instantiateSource, wasm, runtimeModules, storagePath, guestPath, storageReadOnly,
         maxMemoryBytes, maxTableElements, maxModuleBytes, maxHostCallBytes, maxOutputBytes,
-        maxWasiPollMillis, storageMaxBytes, storageMaxEntries, storageMaxFileBytes,
-        maxExecutionMillis, methodId, arguments, maxArgumentBytes, maxResultBytes, executeHttp) => {
+        maxWasiPollMillis, storageMaxBytes, storageMaxEntries, storageMaxFileBytes, executeHttp) => {
         let worker = null;
-        let timer = null;
         let objectUrl = null;
-        let settled = false;
-        let rejectOuter = null;
+        let closed = false;
+        let nextCallId = 1;
+        const pending = new Map();
+        let readyResolve = null;
+        let readyReject = null;
 
         const workerBody = String.raw`
 const instantiate = (` + instantiateSource + String.raw`);
@@ -930,6 +1246,11 @@ const FAILURE = 2;
 const CANCELLED = 3;
 const pendingHttp = new Map();
 let nextHttpId = 1;
+let runtimeState = null;
+let config = null;
+let activeCallId = null;
+const cancelledCalls = new Set();
+let callQueue = Promise.resolve();
 
 const readU32 = (bytes, start) => {
     let value = 0;
@@ -1119,209 +1440,332 @@ const executeHttp = (metadata, body) => new Promise((resolve, reject) => {
     self.postMessage({ type: 'http', id, metadata, body });
 });
 
-self.onmessage = async (event) => {
-    const msg = event.data;
-    if (msg && msg.type === 'http-response') {
-        const pending = pendingHttp.get(msg.id);
-        if (pending) { pendingHttp.delete(msg.id); pending.resolve({ metadata: msg.metadata, body: msg.body }); }
-        return;
-    }
-    if (msg && msg.type === 'http-error') {
-        const pending = pendingHttp.get(msg.id);
-        if (pending) { pendingHttp.delete(msg.id); pending.reject(new Error(msg.message || 'HTTP capability failed')); }
-        return;
-    }
-    if (!msg || msg.type !== 'run') return;
 
-    const executeRun = async () => {
-        const rootBytes = transformModule(msg.wasm, msg.maxMemoryBytes, msg.maxTableElements, msg.maxModuleBytes);
-        const linked = msg.runtimeModules.map((entry) => ({
-            name: entry.name,
-            bytes: transformModule(entry.bytes, msg.maxMemoryBytes, msg.maxTableElements, msg.maxModuleBytes),
-        }));
-        const module = new WebAssembly.Module(rootBytes);
-        const runtime = instantiate(
-            module,
-            linked,
-            msg.storagePath,
-            msg.guestPath,
-            msg.storageReadOnly,
-            msg.maxHostCallBytes,
-            msg.maxOutputBytes,
-            msg.maxWasiPollMillis,
-            msg.storageMaxBytes,
-            msg.storageMaxEntries,
-            msg.storageMaxFileBytes,
-            executeHttp,
-        );
-        checkMemory(runtime, msg.maxMemoryBytes);
-        const ex = runtime.instance.exports;
-        const prepareArguments = ex['__wasmtime_extension_argument_prepare'];
-        const setArgumentByte = ex['__wasmtime_extension_argument_byte'];
-        const start = ex['__wasmtime_extension_start'];
-        const poll = ex['__wasmtime_extension_poll'];
-        const nextWake = ex['__wasmtime_extension_next_wake_millis'];
-        const cancel = ex['__wasmtime_extension_cancel'];
-        if (msg.maxArgumentBytes > 0 && msg.arguments.length > msg.maxArgumentBytes) {
-            throw new Error('extension argument payload exceeds configured size limit');
-        }
-        if (typeof prepareArguments !== 'function' || typeof setArgumentByte !== 'function') {
-            throw new Error('required extension argument exports are missing');
-        }
-        if ((prepareArguments(msg.arguments.length, 0) | 0) !== 0) throw new Error('extension rejected argument payload');
-        for (let i = 0; i < msg.arguments.length; i++) {
-            if ((setArgumentByte(i, msg.arguments[i]) | 0) !== 0) throw new Error('extension rejected argument byte ' + i);
-        }
-        let state = await invokeAsync(start, msg.methodId, 0);
+const postWorkerError = (callId, error) => {
+    self.postMessage({
+        type: 'worker-error',
+        callId,
+        message: error && error.message ? String(error.message) : String(error),
+    });
+};
+
+const initialize = async (msg) => {
+    if (runtimeState !== null) throw new Error('extension worker is already initialized');
+    const rootBytes = transformModule(msg.wasm, msg.maxMemoryBytes, msg.maxTableElements, msg.maxModuleBytes);
+    const linked = msg.runtimeModules.map((entry) => ({
+        name: entry.name,
+        bytes: transformModule(entry.bytes, msg.maxMemoryBytes, msg.maxTableElements, msg.maxModuleBytes),
+    }));
+    const module = new WebAssembly.Module(rootBytes);
+    const runtime = instantiate(
+        module,
+        linked,
+        [],
+        msg.storagePath,
+        msg.guestPath,
+        msg.storageReadOnly,
+        msg.maxHostCallBytes,
+        msg.maxOutputBytes,
+        msg.maxWasiPollMillis,
+        msg.storageMaxBytes,
+        msg.storageMaxEntries,
+        msg.storageMaxFileBytes,
+        () => { throw new Error('custom host imports are unavailable to extension workers'); },
+        executeHttp,
+    );
+    checkMemory(runtime, msg.maxMemoryBytes);
+    runtimeState = { runtime, exports: runtime.instance.exports };
+    config = {
+        storagePath: msg.storagePath,
+        storageReadOnly: msg.storageReadOnly,
+        maxMemoryBytes: msg.maxMemoryBytes,
+    };
+};
+
+const executeInvocation = async (msg) => {
+    if (runtimeState === null || config === null) throw new Error('extension worker is not initialized');
+    if (cancelledCalls.has(msg.callId)) {
+        cancelledCalls.delete(msg.callId);
+        self.postMessage({
+            type: 'cancelled', callId: msg.callId,
+            failure: { type: 'CancellationException', message: 'extension call cancelled', stack: '' },
+        });
+        return;
+    }
+
+    const runtime = runtimeState.runtime;
+    const ex = runtimeState.exports;
+    const prepareArguments = ex['__wasmtime_extension_argument_prepare'];
+    const setArgumentByte = ex['__wasmtime_extension_argument_byte'];
+    const start = ex['__wasmtime_extension_start'];
+    const poll = ex['__wasmtime_extension_poll'];
+    const nextWake = ex['__wasmtime_extension_next_wake_millis'];
+    const cancel = ex['__wasmtime_extension_cancel'];
+
+    if (msg.maxArgumentBytes > 0 && msg.arguments.length > msg.maxArgumentBytes) {
+        throw new Error('extension argument payload exceeds configured size limit');
+    }
+    if (typeof prepareArguments !== 'function' || typeof setArgumentByte !== 'function') {
+        throw new Error('required extension argument exports are missing');
+    }
+    if ((prepareArguments(msg.arguments.length, 0) | 0) !== 0) throw new Error('extension rejected argument payload');
+    for (let i = 0; i < msg.arguments.length; i++) {
+        if ((setArgumentByte(i, msg.arguments[i]) | 0) !== 0) throw new Error('extension rejected argument byte ' + i);
+    }
+
+    activeCallId = msg.callId;
+    let state = PENDING;
+    try {
+        state = await invokeAsync(start, msg.methodId, 0);
         let lastPoll = performance.now();
-        try {
-            while (state === PENDING) {
-                const wake = typeof nextWake === 'function' ? (nextWake(0, 0) | 0) : -1;
-                if (wake > 0) await new Promise((resolve) => setTimeout(resolve, wake));
-                else if (wake === 0) await Promise.resolve();
-                else await new Promise((resolve) => setTimeout(resolve, 1));
+        while (state === PENDING) {
+            if (cancelledCalls.has(msg.callId) && typeof cancel === 'function') {
+                state = cancel(0, 0) | 0;
+                if (state !== PENDING) break;
+            }
+            const wake = typeof nextWake === 'function' ? (nextWake(0, 0) | 0) : -1;
+            if (wake > 0) await new Promise((resolve) => setTimeout(resolve, wake));
+            else if (wake === 0) await Promise.resolve();
+            else await new Promise((resolve) => setTimeout(resolve, 1));
+
+            if (cancelledCalls.has(msg.callId) && typeof cancel === 'function') {
+                state = cancel(0, 0) | 0;
+            } else {
                 const now = performance.now();
                 const elapsed = Math.max(0, Math.min(2147483647, Math.floor(now - lastPoll)));
                 state = await invokeAsync(poll, elapsed, 0);
                 lastPoll = now;
-                checkMemory(runtime, msg.maxMemoryBytes);
             }
-        } finally {
-            if (state === PENDING && typeof cancel === 'function') cancel(0, 0);
+            checkMemory(runtime, config.maxMemoryBytes);
         }
+    } finally {
+        if (state === PENDING && typeof cancel === 'function') cancel(0, 0);
+        activeCallId = null;
+        cancelledCalls.delete(msg.callId);
+    }
 
-        if (state === SUCCESS) {
-            const bytes = messageBytes(ex, '__wasmtime_extension_result_length', '__wasmtime_extension_result_byte', msg.maxResultBytes);
-            self.postMessage({ type: 'result', bytes }, [bytes.buffer]);
-        } else if (state === FAILURE) {
-            const bytes = messageBytes(ex, '__wasmtime_extension_error_length', '__wasmtime_extension_error_byte', msg.maxResultBytes);
-            self.postMessage({ type: 'failure', failure: decodeFailure(bytes) });
-        } else if (state === CANCELLED) {
-            const bytes = messageBytes(ex, '__wasmtime_extension_error_length', '__wasmtime_extension_error_byte', msg.maxResultBytes);
-            self.postMessage({ type: 'cancelled', failure: decodeFailure(bytes) });
-        } else {
-            throw new Error('invalid extension call state: ' + state);
+    if (state === SUCCESS) {
+        const bytes = messageBytes(ex, '__wasmtime_extension_result_length', '__wasmtime_extension_result_byte', msg.maxResultBytes);
+        self.postMessage({ type: 'result', callId: msg.callId, bytes }, [bytes.buffer]);
+    } else if (state === FAILURE) {
+        const bytes = messageBytes(ex, '__wasmtime_extension_error_length', '__wasmtime_extension_error_byte', msg.maxResultBytes);
+        self.postMessage({ type: 'failure', callId: msg.callId, failure: decodeFailure(bytes) });
+    } else if (state === CANCELLED) {
+        const bytes = messageBytes(ex, '__wasmtime_extension_error_length', '__wasmtime_extension_error_byte', msg.maxResultBytes);
+        self.postMessage({ type: 'cancelled', callId: msg.callId, failure: decodeFailure(bytes) });
+    } else {
+        throw new Error('invalid extension call state: ' + state);
+    }
+};
+
+const executeWithStorageLock = async (msg) => {
+    if (config.storagePath && !config.storageReadOnly) {
+        if (!self.navigator || !self.navigator.locks || typeof self.navigator.locks.request !== 'function') {
+            throw new Error('Web Locks are required for writable sandbox storage');
+        }
+        let acquired = false;
+        const lockName = 'wasmtime-kmp-storage:' + config.storagePath;
+        await self.navigator.locks.request(lockName, { mode: 'exclusive', ifAvailable: true }, async (lock) => {
+            if (lock === null) return;
+            acquired = true;
+            await executeInvocation(msg);
+        });
+        if (!acquired) throw new Error('sandbox storage is already in use');
+    } else {
+        await executeInvocation(msg);
+    }
+};
+
+self.onmessage = (event) => {
+    const msg = event.data;
+    if (!msg) return;
+    if (msg.type === 'http-response') {
+        const pending = pendingHttp.get(msg.id);
+        if (pending) { pendingHttp.delete(msg.id); pending.resolve({ metadata: msg.metadata, body: msg.body }); }
+        return;
+    }
+    if (msg.type === 'http-error') {
+        const pending = pendingHttp.get(msg.id);
+        if (pending) { pendingHttp.delete(msg.id); pending.reject(new Error(msg.message || 'HTTP capability failed')); }
+        return;
+    }
+    if (msg.type === 'cancel') {
+        cancelledCalls.add(msg.callId);
+        if (activeCallId === msg.callId && runtimeState !== null) {
+            const cancel = runtimeState.exports['__wasmtime_extension_cancel'];
+            if (typeof cancel === 'function') cancel(0, 0);
+        }
+        return;
+    }
+    if (msg.type === 'init') {
+        initialize(msg).then(
+            () => self.postMessage({ type: 'ready' }),
+            (error) => postWorkerError(null, error),
+        );
+        return;
+    }
+    if (msg.type !== 'invoke') return;
+
+    const run = async () => {
+        try {
+            await executeWithStorageLock(msg);
+        } catch (error) {
+            postWorkerError(msg.callId, error);
         }
     };
-
-    try {
-        if (msg.storagePath && !msg.storageReadOnly) {
-            if (!self.navigator || !self.navigator.locks || typeof self.navigator.locks.request !== 'function') {
-                throw new Error('Web Locks are required for writable sandbox storage');
-            }
-            let acquired = false;
-            const lockName = 'wasmtime-kmp-storage:' + msg.storagePath;
-            await self.navigator.locks.request(lockName, { mode: 'exclusive', ifAvailable: true }, async (lock) => {
-                if (lock === null) return;
-                acquired = true;
-                await executeRun();
-            });
-            if (!acquired) throw new Error('sandbox storage is already in use');
-        } else {
-            await executeRun();
-        }
-    } catch (error) {
-        self.postMessage({ type: 'failure', message: error && error.message ? String(error.message) : String(error) });
-    }
+    callQueue = callQueue.then(run, run);
 };
 `;
 
-        const promise = new Promise((resolve, reject) => {
-            rejectOuter = reject;
-            try {
-                const blob = new Blob([workerBody], { type: 'text/javascript' });
-                objectUrl = URL.createObjectURL(blob);
-                worker = new Worker(objectUrl);
-            } catch (error) {
-                settled = true;
-                reject(error);
-                return;
+        const cleanup = () => {
+            if (worker !== null) { worker.terminate(); worker = null; }
+            if (objectUrl !== null) { URL.revokeObjectURL(objectUrl); objectUrl = null; }
+        };
+        const makeClosedError = (message) => {
+            const error = new Error(message || 'extension worker is closed');
+            error.name = 'WasmtimeExtensionCancelled';
+            return error;
+        };
+        const failAll = (error) => {
+            if (closed) return;
+            closed = true;
+            cleanup();
+            if (readyReject !== null) readyReject(error);
+            for (const entry of pending.values()) {
+                if (entry.timer !== null) clearTimeout(entry.timer);
+                entry.reject(error);
             }
+            pending.clear();
+        };
 
-            const cleanup = () => {
-                if (timer !== null) { clearTimeout(timer); timer = null; }
-                if (worker !== null) { worker.terminate(); worker = null; }
-                if (objectUrl !== null) { URL.revokeObjectURL(objectUrl); objectUrl = null; }
-            };
-            const finish = (fn, value) => {
-                if (settled) return;
-                settled = true;
-                cleanup();
-                fn(value);
-            };
+        const ready = new Promise((resolve, reject) => {
+            readyResolve = resolve;
+            readyReject = reject;
+        });
 
+        try {
+            const blob = new Blob([workerBody], { type: 'text/javascript' });
+            objectUrl = URL.createObjectURL(blob);
+            worker = new Worker(objectUrl);
+        } catch (error) {
+            failAll(error);
+        }
+
+        if (worker !== null) {
             worker.onmessage = (event) => {
                 const msg = event.data;
                 if (!msg) return;
                 if (msg.type === 'http') {
                     Promise.resolve(executeHttp(msg.metadata, msg.body)).then(
                         (response) => {
-                            if (settled || worker === null) return;
+                            if (closed || worker === null) return;
                             worker.postMessage({ type: 'http-response', id: msg.id, metadata: response.metadata, body: response.body });
                         },
                         (error) => {
-                            if (settled || worker === null) return;
+                            if (closed || worker === null) return;
                             worker.postMessage({ type: 'http-error', id: msg.id, message: error && error.message ? String(error.message) : String(error) });
                         },
                     );
                     return;
                 }
+                if (msg.type === 'ready') {
+                    if (readyResolve !== null) readyResolve(true);
+                    readyResolve = null;
+                    readyReject = null;
+                    return;
+                }
+                if (msg.type === 'worker-error' && msg.callId == null) {
+                    failAll(new Error(msg.message || 'extension worker initialization failed'));
+                    return;
+                }
+                if (msg.callId == null) return;
+                const entry = pending.get(msg.callId);
+                if (!entry) return;
+                pending.delete(msg.callId);
+                if (entry.timer !== null) clearTimeout(entry.timer);
+
                 if (msg.type === 'result') {
-                    finish(resolve, msg.bytes);
+                    entry.resolve(msg.bytes);
                 } else if (msg.type === 'cancelled') {
                     const failure = msg.failure || {};
                     const error = new Error(failure.message || 'extension call cancelled');
                     error.name = 'WasmtimeExtensionCancelled';
                     error.remoteType = failure.type || 'CancellationException';
                     error.guestStack = failure.stack || '';
-                    finish(reject, error);
+                    entry.reject(error);
                 } else if (msg.type === 'failure') {
                     const failure = msg.failure || {};
                     const error = new Error(failure.message || 'extension call failed');
                     error.name = 'WasmtimeExtensionRemote';
                     error.remoteType = failure.type || 'Throwable';
                     error.guestStack = failure.stack || '';
-                    finish(reject, error);
+                    entry.reject(error);
+                } else if (msg.type === 'worker-error') {
+                    entry.reject(new Error(msg.message || 'extension worker call failed'));
                 }
             };
-            worker.onerror = (event) => finish(reject, new Error(event.message || 'extension worker failed'));
-
-            if (maxExecutionMillis > 0) {
-                timer = setTimeout(() => {
-                    const error = new Error('extension execution timed out after ' + maxExecutionMillis + ' ms');
-                    error.name = 'WasmtimeExtensionTimeout';
-                    finish(reject, error);
-                }, maxExecutionMillis);
-            }
-
+            worker.onerror = (event) => failAll(new Error(event.message || 'extension worker failed'));
             worker.postMessage({
-                type: 'run', wasm, runtimeModules, storagePath, guestPath, storageReadOnly,
+                type: 'init', wasm, runtimeModules, storagePath, guestPath, storageReadOnly,
                 maxMemoryBytes, maxTableElements, maxModuleBytes, maxHostCallBytes, maxOutputBytes,
                 maxWasiPollMillis, storageMaxBytes, storageMaxEntries, storageMaxFileBytes,
-                methodId, arguments, maxArgumentBytes, maxResultBytes,
             });
-        });
+        }
 
         return {
-            promise,
-            cancel: () => {
-                if (settled) return;
-                settled = true;
-                if (timer !== null) clearTimeout(timer);
-                if (worker !== null) worker.terminate();
-                if (objectUrl !== null) URL.revokeObjectURL(objectUrl);
-                worker = null;
-                objectUrl = null;
-                if (rejectOuter !== null) {
-                    const error = new Error('extension execution cancelled');
-                    error.name = 'WasmtimeExtensionCancelled';
-                    rejectOuter(error);
-                }
+            ready,
+            get closed() { return closed; },
+            invoke(methodId, argumentBytes, maxArgumentBytes, maxResultBytes, maxExecutionMillis) {
+                let callId = null;
+                let cancelled = false;
+                let rejectOuter = null;
+                const promise = new Promise((resolve, reject) => {
+                    rejectOuter = reject;
+                    ready.then(() => {
+                        if (cancelled) return;
+                        if (closed || worker === null) {
+                            reject(makeClosedError('extension worker is closed'));
+                            return;
+                        }
+                        callId = nextCallId++;
+                        let timer = null;
+                        pending.set(callId, { resolve, reject, timer: null });
+                        if (maxExecutionMillis > 0) {
+                            timer = setTimeout(() => {
+                                const error = new Error('extension execution timed out after ' + maxExecutionMillis + ' ms');
+                                error.name = 'WasmtimeExtensionTimeout';
+                                failAll(error);
+                            }, maxExecutionMillis);
+                            pending.get(callId).timer = timer;
+                        }
+                        worker.postMessage({
+                            type: 'invoke', callId, methodId, arguments: argumentBytes, maxArgumentBytes, maxResultBytes,
+                        });
+                    }, reject);
+                });
+                return {
+                    promise,
+                    cancel() {
+                        if (cancelled) return;
+                        cancelled = true;
+                        const error = makeClosedError('extension execution cancelled');
+                        if (callId !== null && worker !== null && !closed) {
+                            worker.postMessage({ type: 'cancel', callId });
+                        }
+                        // Hard cancellation must also stop CPU-bound Wasm that cannot process messages.
+                        failAll(error);
+                        if (rejectOuter !== null) rejectOuter(error);
+                    },
+                };
+            },
+            close() {
+                if (closed) return;
+                failAll(makeClosedError('extension worker closed'));
             },
         };
     }"""
 )
-private external fun jsRunExtensionWorker(
+private external fun jsCreateExtensionWorker(
     instantiateSource: String,
     wasm: JsAny,
     runtimeModules: JsAny,
@@ -1337,13 +1781,21 @@ private external fun jsRunExtensionWorker(
     storageMaxBytes: Double,
     storageMaxEntries: Int,
     storageMaxFileBytes: Double,
-    maxExecutionMillis: Double,
+    executeHttp: (JsAny, JsAny) -> Promise<JsAny>,
+): JsAny
+
+@JsFun("(session, methodId, argumentBytes, maxArgumentBytes, maxResultBytes, maxExecutionMillis) => session.invoke(methodId, argumentBytes, maxArgumentBytes, maxResultBytes, maxExecutionMillis)")
+private external fun jsInvokeExtensionWorker(
+    session: JsAny,
     methodId: Int,
     arguments: JsAny,
     maxArgumentBytes: Int,
     maxResultBytes: Int,
-    executeHttp: (JsAny, JsAny) -> Promise<JsAny>,
+    maxExecutionMillis: Double,
 ): JsAny
+
+@JsFun("(session) => session.close()")
+private external fun jsCloseExtensionWorker(session: JsAny)
 
 @JsFun("(task) => task.promise")
 private external fun jsExtensionWorkerTaskPromise(task: JsAny): Promise<JsAny>
@@ -1388,3 +1840,14 @@ private external fun jsNewArray(): JsAny
 
 @JsFun("(array, name, bytes) => { array.push({ name, bytes }); }")
 private external fun jsPushRuntimeModule(array: JsAny, name: String, bytes: JsAny)
+
+
+@JsFun("(array, module, name, params, results, index) => { array.push({ module, name, params, results, index }); }")
+private external fun jsPushHostImport(
+    array: JsAny,
+    module: String,
+    name: String,
+    params: String,
+    results: String,
+    index: Int,
+)

@@ -13,6 +13,49 @@ typedef struct wasmtime_kmp_instance wasmtime_kmp_instance_t;
 typedef struct wasmtime_kmp_module wasmtime_kmp_module_t;
 typedef struct wasmtime_kmp_func_i32_2 wasmtime_kmp_func_i32_2_t;
 typedef struct wasmtime_kmp_func_i32_2_future wasmtime_kmp_func_i32_2_future_t;
+typedef struct wasmtime_kmp_func wasmtime_kmp_func_t;
+typedef struct wasmtime_kmp_caller wasmtime_kmp_caller_t;
+
+enum {
+    WASMTIME_KMP_I32 = 0,
+    WASMTIME_KMP_I64 = 1,
+    WASMTIME_KMP_F32 = 2,
+    WASMTIME_KMP_F64 = 3,
+};
+
+typedef struct wasmtime_kmp_value {
+    int32_t kind;
+    uint64_t bits;
+} wasmtime_kmp_value_t;
+
+typedef struct wasmtime_kmp_host_function {
+    const char *module;
+    const char *name;
+    const int32_t *parameter_kinds;
+    size_t parameter_count;
+    const int32_t *result_kinds;
+    size_t result_count;
+    size_t function_index;
+} wasmtime_kmp_host_function_t;
+
+typedef int (*wasmtime_kmp_host_invoke_fn)(
+    void *user_data,
+    size_t function_index,
+    wasmtime_kmp_caller_t *caller,
+    const wasmtime_kmp_value_t *arguments,
+    size_t argument_count,
+    wasmtime_kmp_value_t *results,
+    size_t result_count,
+    char **error_out
+);
+
+typedef void (*wasmtime_kmp_host_dispose_fn)(void *user_data);
+
+typedef struct wasmtime_kmp_host_imports {
+    void *user_data;
+    wasmtime_kmp_host_invoke_fn invoke;
+    wasmtime_kmp_host_dispose_fn dispose;
+} wasmtime_kmp_host_imports_t;
 
 typedef struct wasmtime_kmp_limits {
     int64_t max_memory_bytes;
@@ -110,6 +153,19 @@ wasmtime_kmp_instance_t *wasmtime_kmp_instantiate_with_runtime(
     char **error_out
 );
 
+wasmtime_kmp_instance_t *wasmtime_kmp_instantiate_with_runtime_and_imports(
+    wasmtime_kmp_module_t *module,
+    const wasmtime_kmp_linked_module_t *runtime_modules,
+    size_t runtime_module_count,
+    const wasmtime_kmp_host_function_t *host_functions,
+    size_t host_function_count,
+    const wasmtime_kmp_host_imports_t *host_imports,
+    const wasmtime_kmp_limits_t *limits,
+    const wasmtime_kmp_http_handler_t *http_handler,
+    const wasmtime_kmp_storage_t *storage,
+    char **error_out
+);
+
 wasmtime_kmp_instance_t *wasmtime_kmp_instantiate_with_http(
     wasmtime_kmp_module_t *module,
     const wasmtime_kmp_limits_t *limits,
@@ -138,6 +194,20 @@ wasmtime_kmp_instance_t *wasmtime_kmp_load_with_runtime(
     size_t wasm_len,
     const wasmtime_kmp_linked_module_t *runtime_modules,
     size_t runtime_module_count,
+    const wasmtime_kmp_limits_t *limits,
+    const wasmtime_kmp_http_handler_t *http_handler,
+    const wasmtime_kmp_storage_t *storage,
+    char **error_out
+);
+
+wasmtime_kmp_instance_t *wasmtime_kmp_load_with_runtime_and_imports(
+    const uint8_t *wasm,
+    size_t wasm_len,
+    const wasmtime_kmp_linked_module_t *runtime_modules,
+    size_t runtime_module_count,
+    const wasmtime_kmp_host_function_t *host_functions,
+    size_t host_function_count,
+    const wasmtime_kmp_host_imports_t *host_imports,
     const wasmtime_kmp_limits_t *limits,
     const wasmtime_kmp_http_handler_t *http_handler,
     const wasmtime_kmp_storage_t *storage,
@@ -206,6 +276,77 @@ void wasmtime_kmp_func_i32_2_call_async_close(
 );
 
 void wasmtime_kmp_func_i32_2_close(wasmtime_kmp_func_i32_2_t *function);
+
+wasmtime_kmp_func_t *wasmtime_kmp_resolve_func(
+    wasmtime_kmp_instance_t *instance,
+    const char *export_name,
+    const int32_t *parameter_kinds,
+    size_t parameter_count,
+    const int32_t *result_kinds,
+    size_t result_count,
+    char **error_out
+);
+
+int wasmtime_kmp_func_call(
+    wasmtime_kmp_func_t *function,
+    const wasmtime_kmp_value_t *arguments,
+    size_t argument_count,
+    wasmtime_kmp_value_t *results,
+    size_t result_count,
+    char **error_out
+);
+
+void wasmtime_kmp_func_close(wasmtime_kmp_func_t *function);
+
+int wasmtime_kmp_memory_size(
+    wasmtime_kmp_instance_t *instance,
+    const char *export_name,
+    size_t *size_out,
+    char **error_out
+);
+
+int wasmtime_kmp_memory_read(
+    wasmtime_kmp_instance_t *instance,
+    const char *export_name,
+    size_t offset,
+    uint8_t *target,
+    size_t length,
+    char **error_out
+);
+
+int wasmtime_kmp_memory_write(
+    wasmtime_kmp_instance_t *instance,
+    const char *export_name,
+    size_t offset,
+    const uint8_t *source,
+    size_t length,
+    char **error_out
+);
+
+int wasmtime_kmp_caller_memory_size(
+    wasmtime_kmp_caller_t *caller,
+    const char *export_name,
+    size_t *size_out,
+    char **error_out
+);
+
+int wasmtime_kmp_caller_memory_read(
+    wasmtime_kmp_caller_t *caller,
+    const char *export_name,
+    size_t offset,
+    uint8_t *target,
+    size_t length,
+    char **error_out
+);
+
+int wasmtime_kmp_caller_memory_write(
+    wasmtime_kmp_caller_t *caller,
+    const char *export_name,
+    size_t offset,
+    const uint8_t *source,
+    size_t length,
+    char **error_out
+);
 
 void wasmtime_kmp_close(wasmtime_kmp_instance_t *instance);
 void wasmtime_kmp_module_close(wasmtime_kmp_module_t *module);

@@ -17,6 +17,7 @@ kotlin {
 
     sourceSets.wasmWasiMain.dependencies {
         api(libs.kotlin.coroutines.core)
+        api(libs.kotlin.serialization.cbor)
         api("org.jetbrains.kotlinx:kotlinx-io-core:0.9.1")
     }
 }

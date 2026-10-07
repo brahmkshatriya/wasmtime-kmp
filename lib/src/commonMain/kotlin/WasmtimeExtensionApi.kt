@@ -1,9 +1,14 @@
 package dev.brahmkshatriya.wasmtime
 
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
-public const val WASMTIME_EXTENSION_API_VERSION: Int = 1
+public const val WASMTIME_EXTENSION_API_VERSION: Int = 2
 
 /** Capabilities declared by an extension bundle. They describe requirements; the host still chooses what to grant. */
 public enum class WasmtimeExtensionCapability {
@@ -14,6 +19,7 @@ public enum class WasmtimeExtensionCapability {
     Credentials,
     Logging,
     Streaming,
+    HostResources,
 }
 
 /** Build-time metadata packaged next to an extension Wasm artifact. */
@@ -88,6 +94,115 @@ public fun interface WasmtimeResourceProvider {
     public suspend fun open(name: String): WasmtimeByteStream?
 }
 
+/** Handler for one host-owned resource exposed to a Wasm extension by opaque handle. */
+public fun interface WasmtimeHostResourceHandler {
+    public suspend fun invoke(operation: Int, payload: ByteArray): ByteArray
+}
+
+private data class WasmtimeHostResourceEntry(
+    val handler: WasmtimeHostResourceHandler,
+    val close: suspend () -> Unit,
+)
+
+/**
+ * Registry for host-owned behavior/state that a guest can call through opaque handles.
+ *
+ * Handles are application-level values: callers transport the returned [Long] inside their own CBOR DTO.
+ */
+public class WasmtimeHostResourceRegistry(
+    private val maxResources: Int = 4_096,
+) {
+    private val lock = Mutex()
+    private val resources = mutableMapOf<Long, WasmtimeHostResourceEntry>()
+    private var nextHandle: Long = 1L
+
+    init {
+        require(maxResources > 0) { "maxResources must be positive" }
+    }
+
+    public suspend fun register(
+        handler: WasmtimeHostResourceHandler,
+        close: suspend () -> Unit = {},
+    ): Long = lock.withLock {
+        require(resources.size < maxResources) { "host resource limit exceeded: $maxResources" }
+        check(nextHandle > 0L) { "host resource handle space exhausted" }
+        val handle = nextHandle++
+        resources[handle] = WasmtimeHostResourceEntry(handler, close)
+        handle
+    }
+
+    /** Registers a callback using the standard CALL operation. */
+    public suspend fun registerCallback(callback: suspend (ByteArray) -> ByteArray): Long =
+        register(WasmtimeHostResourceHandler { operation, payload ->
+            require(operation == WasmtimeRemoteResourceOperation.CALL) {
+                "unsupported host callback operation: $operation"
+            }
+            callback(payload)
+        })
+
+    /** Registers a standard pull stream. A `null` value is encoded as end-of-stream. */
+    public suspend fun registerStream(
+        next: suspend () -> ByteArray?,
+        close: suspend () -> Unit = {},
+    ): Long = register(
+        handler = WasmtimeHostResourceHandler { operation, _ ->
+            require(operation == WasmtimeRemoteResourceOperation.NEXT) {
+                "unsupported host stream operation: $operation"
+            }
+            val item = next()
+            if (item == null) byteArrayOf(0) else byteArrayOf(1) + item
+        },
+        close = close,
+    )
+
+    /** Registers a host [Flow] as a backpressured pull stream for the guest. */
+    public suspend fun registerFlow(scope: CoroutineScope, flow: Flow<ByteArray>): Long {
+        val channel = Channel<ByteArray>(capacity = 0)
+        val job = scope.launch {
+            try {
+                flow.collect { channel.send(it) }
+            } finally {
+                channel.close()
+            }
+        }
+        return try {
+            registerStream(
+                next = { channel.receiveCatching().getOrNull() },
+                close = {
+                    job.cancel()
+                    channel.cancel()
+                },
+            )
+        } catch (error: Throwable) {
+            job.cancel()
+            channel.cancel()
+            throw error
+        }
+    }
+
+    public suspend fun release(handle: Long): Boolean {
+        val entry = lock.withLock { resources.remove(handle) } ?: return false
+        entry.close()
+        return true
+    }
+
+    /** Releases every resource in this registry. */
+    public suspend fun clear() {
+        val entries = lock.withLock {
+            resources.values.toList().also { resources.clear() }
+        }
+        entries.forEach { it.close() }
+    }
+
+    internal suspend fun invokeOrNull(handle: Long, operation: Int, payload: ByteArray): ByteArray? {
+        if (operation == WasmtimeRemoteResourceOperation.RELEASE) {
+            return if (release(handle)) ByteArray(0) else null
+        }
+        val entry = lock.withLock { resources[handle] } ?: return null
+        return entry.handler.invoke(operation, payload)
+    }
+}
+
 /**
  * HTTP capability wrapper with optional host-owned credential injection.
  *
@@ -123,12 +238,13 @@ public data class WasmtimeHostServices(
     public val storage: WasmtimeExtensionStorage? = null,
     public val credentials: WasmtimeCredentialProvider? = null,
     public val resources: WasmtimeResourceProvider? = null,
+    public val remoteResources: WasmtimeHostResourceRegistry? = null,
     public val logger: WasmtimeExtensionLogger? = null,
 ) {
     internal fun effectiveHttp(extensionId: String? = null): WasmtimeHttpHandler? {
         val network = http?.let { WasmtimeHttpService(it, credentials) }
-        if (network == null && resources == null && logger == null) return null
-        return WasmtimeHostServiceRouter(network, resources, logger, extensionId)
+        if (network == null && resources == null && remoteResources == null && logger == null) return null
+        return WasmtimeHostServiceRouter(network, resources, remoteResources, logger, extensionId)
     }
 
     internal fun effectiveStorage(): WasmtimeStorage? = storage?.toMount()
@@ -137,6 +253,7 @@ public data class WasmtimeHostServices(
 private class WasmtimeHostServiceRouter(
     private val network: WasmtimeHttpHandler?,
     private val resources: WasmtimeResourceProvider?,
+    private val remoteResources: WasmtimeHostResourceRegistry?,
     private val logger: WasmtimeExtensionLogger?,
     private val extensionId: String?,
 ) : WasmtimeHttpHandler {
@@ -146,6 +263,7 @@ private class WasmtimeHostServiceRouter(
 
     override suspend fun execute(request: WasmtimeHttpRequest): WasmtimeHttpResponse {
         if (request.url == LOG_SERVICE_URL) return log(request)
+        if (request.url == HOST_RESOURCE_SERVICE_URL) return remoteResource(request)
         if (request.url != RESOURCE_SERVICE_URL) {
             return requireNotNull(network) { "HTTP capability is not available" }.execute(request)
         }
@@ -154,6 +272,22 @@ private class WasmtimeHostServiceRouter(
             RESOURCE_READ -> readResource(request)
             RESOURCE_CLOSE -> closeResource(request)
             else -> WasmtimeHttpResponse(405)
+        }
+    }
+
+    private suspend fun remoteResource(request: WasmtimeHttpRequest): WasmtimeHttpResponse {
+        val registry = remoteResources ?: return WasmtimeHttpResponse(403)
+        if (request.method != HOST_RESOURCE_INVOKE) return WasmtimeHttpResponse(405)
+        val handle = request.header(HOST_RESOURCE_HANDLE_HEADER)?.toLongOrNull()
+            ?: return WasmtimeHttpResponse(400)
+        val operation = request.header(HOST_RESOURCE_OPERATION_HEADER)?.toIntOrNull()
+            ?: return WasmtimeHttpResponse(400)
+        val result = registry.invokeOrNull(handle, operation, request.body)
+            ?: return WasmtimeHttpResponse(404)
+        return if (operation == WasmtimeRemoteResourceOperation.RELEASE) {
+            WasmtimeHttpResponse(204)
+        } else {
+            WasmtimeHttpResponse(200, body = result)
         }
     }
 
@@ -218,6 +352,10 @@ internal const val RESOURCE_MAX_BYTES_HEADER: String = "X-Wasmtime-Resource-Max-
 internal const val LOG_SERVICE_URL: String = "wasmtime://log"
 internal const val LOG_WRITE: String = "LOG"
 internal const val LOG_LEVEL_HEADER: String = "X-Wasmtime-Log-Level"
+internal const val HOST_RESOURCE_SERVICE_URL: String = "wasmtime://host-resource"
+internal const val HOST_RESOURCE_INVOKE: String = "RESOURCE_INVOKE"
+internal const val HOST_RESOURCE_HANDLE_HEADER: String = "X-Wasmtime-Host-Resource-Handle"
+internal const val HOST_RESOURCE_OPERATION_HEADER: String = "X-Wasmtime-Host-Resource-Operation"
 
 /** Host backing directory mounted at the standard `/extension` guest namespace. */
 public data class WasmtimeExtensionStorage(
@@ -321,6 +459,22 @@ public class WasmtimeLoadedExtension<T> internal constructor(
 ) : AutoCloseable {
     private var closed: Boolean = false
 
+    /** Whether this loaded backend can keep guest-owned resource handles alive across calls. */
+    public val supportsPersistentResources: Boolean
+        get() = transport.supportsPersistentResources
+
+    /** Wraps an opaque handle returned by the guest. */
+    public fun remoteResource(handle: Long): WasmtimeRemoteResource =
+        WasmtimeRemoteResource(transport, handle)
+
+    /** Wraps a guest handle registered as a standard callback resource. */
+    public fun remoteCallback(handle: Long): WasmtimeRemoteCallback =
+        WasmtimeRemoteCallback(transport, handle)
+
+    /** Wraps a guest handle registered as a standard pull-stream resource. */
+    public fun remoteStream(handle: Long): WasmtimeRemoteStream =
+        WasmtimeRemoteStream(transport, handle)
+
     /** Runs the guest `onUnload()` lifecycle hook, then releases the transport. */
     public suspend fun shutdown() {
         if (closed) return
@@ -368,6 +522,7 @@ private fun validateWasmtimeExtensionCapabilities(
             WasmtimeExtensionCapability.Credentials -> services.http != null && services.credentials != null
             WasmtimeExtensionCapability.Logging -> services.logger != null
             WasmtimeExtensionCapability.Streaming -> services.resources != null
+            WasmtimeExtensionCapability.HostResources -> services.remoteResources != null
         }
     }
     require(missing.isEmpty()) {

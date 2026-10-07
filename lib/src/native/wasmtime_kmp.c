@@ -59,6 +59,13 @@ typedef struct wasmtime_kmp_http_request {
     size_t response_body_len;
 } wasmtime_kmp_http_request_t;
 
+typedef struct wasmtime_kmp_host_function_env {
+    wasmtime_kmp_host_imports_t *imports;
+    size_t function_index;
+    int32_t *result_kinds;
+    size_t result_count;
+} wasmtime_kmp_host_function_env_t;
+
 struct wasmtime_kmp_instance {
     atomic_uint refs;
     atomic_int closing;
@@ -69,11 +76,29 @@ struct wasmtime_kmp_instance {
     wasmtime_kmp_module_t *module_owner;
     uint64_t max_execution_millis;
     wasmtime_kmp_http_handler_t http_handler;
+    wasmtime_kmp_host_imports_t host_imports;
+    wasmtime_kmp_host_function_env_t **host_function_envs;
+    size_t host_function_env_count;
     wasmtime_kmp_http_request_t http_request;
     wasmtime_kmp_wasi_lite_t *wasi;
     size_t max_host_call_bytes;
     size_t max_http_response_bytes;
     int has_async_http;
+};
+
+struct wasmtime_kmp_caller {
+    wasmtime_caller_t *value;
+};
+
+struct wasmtime_kmp_func {
+    atomic_uint refs;
+    atomic_int closed;
+    wasmtime_kmp_instance_t *instance;
+    wasmtime_func_t function;
+    int32_t *parameter_kinds;
+    size_t parameter_count;
+    int32_t *result_kinds;
+    size_t result_count;
 };
 
 struct wasmtime_kmp_func_i32_2 {
@@ -98,6 +123,7 @@ struct wasmtime_kmp_func_i32_2_future {
 static void wasmtime_kmp_module_release(wasmtime_kmp_module_t *module);
 static void wasmtime_kmp_instance_release(wasmtime_kmp_instance_t *instance);
 static void wasmtime_kmp_function_release(wasmtime_kmp_func_i32_2_t *function);
+static void wasmtime_kmp_generic_function_release(wasmtime_kmp_func_t *function);
 
 static char *copy_message(const char *data, size_t size) {
     char *out = (char *) malloc(size + 1);
@@ -109,6 +135,295 @@ static char *copy_message(const char *data, size_t size) {
 
 static char *copy_cstr(const char *data) {
     return copy_message(data, strlen(data));
+}
+
+static int kmp_kind_to_wasm_kind(int32_t kind, wasm_valkind_t *out) {
+    switch (kind) {
+        case WASMTIME_KMP_I32: *out = WASM_I32; return 1;
+        case WASMTIME_KMP_I64: *out = WASM_I64; return 1;
+        case WASMTIME_KMP_F32: *out = WASM_F32; return 1;
+        case WASMTIME_KMP_F64: *out = WASM_F64; return 1;
+        default: return 0;
+    }
+}
+
+static wasm_valtype_t *kmp_new_valtype(int32_t kind) {
+    switch (kind) {
+        case WASMTIME_KMP_I32: return wasm_valtype_new_i32();
+        case WASMTIME_KMP_I64: return wasm_valtype_new_i64();
+        case WASMTIME_KMP_F32: return wasm_valtype_new_f32();
+        case WASMTIME_KMP_F64: return wasm_valtype_new_f64();
+        default: return NULL;
+    }
+}
+
+static wasm_functype_t *kmp_new_functype(
+    const int32_t *parameter_kinds,
+    size_t parameter_count,
+    const int32_t *result_kinds,
+    size_t result_count
+) {
+    wasm_valtype_vec_t params;
+    wasm_valtype_vec_t results;
+    wasm_valtype_vec_new_uninitialized(&params, parameter_count);
+    wasm_valtype_vec_new_uninitialized(&results, result_count);
+    if ((parameter_count > 0 && params.data == NULL)
+        || (result_count > 0 && results.data == NULL)) {
+        wasm_valtype_vec_delete(&params);
+        wasm_valtype_vec_delete(&results);
+        return NULL;
+    }
+    for (size_t index = 0; index < parameter_count; index++) {
+        params.data[index] = kmp_new_valtype(parameter_kinds[index]);
+        if (params.data[index] == NULL) {
+            wasm_valtype_vec_delete(&params);
+            wasm_valtype_vec_delete(&results);
+            return NULL;
+        }
+    }
+    for (size_t index = 0; index < result_count; index++) {
+        results.data[index] = kmp_new_valtype(result_kinds[index]);
+        if (results.data[index] == NULL) {
+            wasm_valtype_vec_delete(&params);
+            wasm_valtype_vec_delete(&results);
+            return NULL;
+        }
+    }
+    return wasm_functype_new(&params, &results);
+}
+
+static int kmp_function_type_matches(
+    const wasm_functype_t *type,
+    const int32_t *parameter_kinds,
+    size_t parameter_count,
+    const int32_t *result_kinds,
+    size_t result_count
+) {
+    const wasm_valtype_vec_t *params = wasm_functype_params(type);
+    const wasm_valtype_vec_t *results = wasm_functype_results(type);
+    if (params->size != parameter_count || results->size != result_count) return 0;
+    for (size_t index = 0; index < parameter_count; index++) {
+        wasm_valkind_t expected;
+        if (!kmp_kind_to_wasm_kind(parameter_kinds[index], &expected)
+            || wasm_valtype_kind(params->data[index]) != expected) return 0;
+    }
+    for (size_t index = 0; index < result_count; index++) {
+        wasm_valkind_t expected;
+        if (!kmp_kind_to_wasm_kind(result_kinds[index], &expected)
+            || wasm_valtype_kind(results->data[index]) != expected) return 0;
+    }
+    return 1;
+}
+
+static int kmp_value_from_wasmtime(
+    const wasmtime_val_t *source,
+    wasmtime_kmp_value_t *target
+) {
+    target->kind = (int32_t) source->kind;
+    switch (source->kind) {
+        case WASMTIME_I32:
+            target->bits = (uint32_t) source->of.i32;
+            return 1;
+        case WASMTIME_I64:
+            target->bits = (uint64_t) source->of.i64;
+            return 1;
+        case WASMTIME_F32: {
+            uint32_t bits = 0;
+            memcpy(&bits, &source->of.f32, sizeof(bits));
+            target->bits = bits;
+            return 1;
+        }
+        case WASMTIME_F64: {
+            uint64_t bits = 0;
+            memcpy(&bits, &source->of.f64, sizeof(bits));
+            target->bits = bits;
+            return 1;
+        }
+        default:
+            return 0;
+    }
+}
+
+static int kmp_value_to_wasmtime(
+    const wasmtime_kmp_value_t *source,
+    int32_t expected_kind,
+    wasmtime_val_t *target
+) {
+    if (source->kind != expected_kind) return 0;
+    target->kind = (wasmtime_valkind_t) expected_kind;
+    switch (expected_kind) {
+        case WASMTIME_KMP_I32:
+            target->of.i32 = (int32_t) (uint32_t) source->bits;
+            return 1;
+        case WASMTIME_KMP_I64:
+            target->of.i64 = (int64_t) source->bits;
+            return 1;
+        case WASMTIME_KMP_F32: {
+            uint32_t bits = (uint32_t) source->bits;
+            memcpy(&target->of.f32, &bits, sizeof(bits));
+            return 1;
+        }
+        case WASMTIME_KMP_F64:
+            memcpy(&target->of.f64, &source->bits, sizeof(source->bits));
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static void host_function_env_delete(wasmtime_kmp_host_function_env_t *env) {
+    if (env == NULL) return;
+    free(env->result_kinds);
+    free(env);
+}
+
+static wasm_trap_t *custom_host_function_callback(
+    void *env_ptr,
+    wasmtime_caller_t *caller,
+    const wasmtime_val_t *arguments,
+    size_t argument_count,
+    wasmtime_val_t *results,
+    size_t result_count
+) {
+    wasmtime_kmp_host_function_env_t *env = env_ptr;
+    if (env == NULL || env->imports == NULL || env->imports->invoke == NULL) {
+        return wasmtime_trap_new("host import callback is unavailable", 35);
+    }
+
+    wasmtime_kmp_value_t *converted_arguments = argument_count > 0
+        ? calloc(argument_count, sizeof(*converted_arguments)) : NULL;
+    wasmtime_kmp_value_t *converted_results = result_count > 0
+        ? calloc(result_count, sizeof(*converted_results)) : NULL;
+    if ((argument_count > 0 && converted_arguments == NULL)
+        || (result_count > 0 && converted_results == NULL)) {
+        free(converted_arguments);
+        free(converted_results);
+        return wasmtime_trap_new("out of memory", 13);
+    }
+
+    for (size_t index = 0; index < argument_count; index++) {
+        if (!kmp_value_from_wasmtime(&arguments[index], &converted_arguments[index])) {
+            free(converted_arguments);
+            free(converted_results);
+            return wasmtime_trap_new("unsupported host import argument type", 37);
+        }
+    }
+    for (size_t index = 0; index < result_count; index++) {
+        converted_results[index].kind = env->result_kinds[index];
+    }
+
+    wasmtime_kmp_caller_t wrapped = { .value = caller };
+    char *callback_error = NULL;
+    int ok = env->imports->invoke(
+        env->imports->user_data,
+        env->function_index,
+        &wrapped,
+        converted_arguments,
+        argument_count,
+        converted_results,
+        result_count,
+        &callback_error
+    );
+    if (!ok) {
+        const char *message = callback_error != NULL ? callback_error : "host import failed";
+        wasm_trap_t *trap = wasmtime_trap_new(message, strlen(message));
+        free(callback_error);
+        free(converted_arguments);
+        free(converted_results);
+        return trap;
+    }
+
+    for (size_t index = 0; index < result_count; index++) {
+        if (!kmp_value_to_wasmtime(
+                &converted_results[index],
+                env->result_kinds[index],
+                &results[index]
+            )) {
+            free(converted_arguments);
+            free(converted_results);
+            return wasmtime_trap_new("host import returned an invalid result type", 43);
+        }
+    }
+
+    free(callback_error);
+    free(converted_arguments);
+    free(converted_results);
+    return NULL;
+}
+
+static wasmtime_error_t *define_custom_host_imports(
+    wasmtime_linker_t *linker,
+    wasmtime_kmp_instance_t *instance,
+    const wasmtime_kmp_host_function_t *functions,
+    size_t function_count
+) {
+    if (function_count == 0) return NULL;
+    if (functions == NULL || instance->host_imports.invoke == NULL) {
+        return wasmtime_error_new("host import definitions require a callback");
+    }
+
+    instance->host_function_envs = calloc(
+        function_count,
+        sizeof(*instance->host_function_envs)
+    );
+    if (instance->host_function_envs == NULL) {
+        return wasmtime_error_new("out of memory");
+    }
+    instance->host_function_env_count = function_count;
+
+    for (size_t index = 0; index < function_count; index++) {
+        const wasmtime_kmp_host_function_t *function = &functions[index];
+        if (function->module == NULL || function->name == NULL) {
+            return wasmtime_error_new("host import name must not be null");
+        }
+        wasm_functype_t *type = kmp_new_functype(
+            function->parameter_kinds,
+            function->parameter_count,
+            function->result_kinds,
+            function->result_count
+        );
+        if (type == NULL) {
+            return wasmtime_error_new("invalid host import function type");
+        }
+
+        wasmtime_kmp_host_function_env_t *env = calloc(1, sizeof(*env));
+        if (env == NULL) {
+            wasm_functype_delete(type);
+            return wasmtime_error_new("out of memory");
+        }
+        env->imports = &instance->host_imports;
+        env->function_index = function->function_index;
+        env->result_count = function->result_count;
+        if (function->result_count > 0) {
+            env->result_kinds = malloc(function->result_count * sizeof(int32_t));
+            if (env->result_kinds == NULL) {
+                host_function_env_delete(env);
+                wasm_functype_delete(type);
+                return wasmtime_error_new("out of memory");
+            }
+            memcpy(
+                env->result_kinds,
+                function->result_kinds,
+                function->result_count * sizeof(int32_t)
+            );
+        }
+        instance->host_function_envs[index] = env;
+
+        wasmtime_error_t *error = wasmtime_linker_define_func(
+            linker,
+            function->module,
+            strlen(function->module),
+            function->name,
+            strlen(function->name),
+            type,
+            custom_host_function_callback,
+            env,
+            NULL
+        );
+        wasm_functype_delete(type);
+        if (error != NULL) return error;
+    }
+    return NULL;
 }
 
 
@@ -744,6 +1059,12 @@ static void http_handler_dispose_value(const wasmtime_kmp_http_handler_t *handle
     }
 }
 
+static void host_imports_dispose_value(const wasmtime_kmp_host_imports_t *imports) {
+    if (imports != NULL && imports->dispose != NULL) {
+        imports->dispose(imports->user_data);
+    }
+}
+
 static void http_free_response_buffer(
     wasmtime_kmp_instance_t *instance,
     uint8_t *buffer,
@@ -1347,10 +1668,13 @@ static int instantiate_linked_module(
     return 1;
 }
 
-wasmtime_kmp_instance_t *wasmtime_kmp_instantiate_with_runtime(
+wasmtime_kmp_instance_t *wasmtime_kmp_instantiate_with_runtime_and_imports(
     wasmtime_kmp_module_t *module,
     const wasmtime_kmp_linked_module_t *runtime_modules,
     size_t runtime_module_count,
+    const wasmtime_kmp_host_function_t *host_functions,
+    size_t host_function_count,
+    const wasmtime_kmp_host_imports_t *host_imports,
     const wasmtime_kmp_limits_t *limits,
     const wasmtime_kmp_http_handler_t *http_handler,
     const wasmtime_kmp_storage_t *storage,
@@ -1359,16 +1683,19 @@ wasmtime_kmp_instance_t *wasmtime_kmp_instantiate_with_runtime(
     if (error_out != NULL) *error_out = NULL;
     if (module == NULL) {
         http_handler_dispose_value(http_handler);
+        host_imports_dispose_value(host_imports);
         set_error(error_out, copy_cstr("module must not be null"));
         return NULL;
     }
     if (limits == NULL) {
         http_handler_dispose_value(http_handler);
+        host_imports_dispose_value(host_imports);
         set_error(error_out, copy_cstr("limits must not be null"));
         return NULL;
     }
     if (!wasmtime_kmp_module_try_retain(module)) {
         http_handler_dispose_value(http_handler);
+        host_imports_dispose_value(host_imports);
         set_error(error_out, copy_cstr("Wasmtime module is closed"));
         return NULL;
     }
@@ -1377,6 +1704,7 @@ wasmtime_kmp_instance_t *wasmtime_kmp_instantiate_with_runtime(
     if (out == NULL) {
         wasmtime_kmp_module_release(module);
         http_handler_dispose_value(http_handler);
+        host_imports_dispose_value(host_imports);
         set_error(error_out, copy_cstr("out of memory"));
         return NULL;
     }
@@ -1395,6 +1723,9 @@ wasmtime_kmp_instance_t *wasmtime_kmp_instantiate_with_runtime(
     if (http_handler != NULL) {
         out->http_handler = *http_handler;
         out->has_async_http = http_handler->execute_start != NULL;
+    }
+    if (host_imports != NULL) {
+        out->host_imports = *host_imports;
     }
     out->max_host_call_bytes = limits->max_host_call_bytes > 0
         ? (size_t) limits->max_host_call_bytes : 0;
@@ -1500,6 +1831,18 @@ wasmtime_kmp_instance_t *wasmtime_kmp_instantiate_with_runtime(
         return NULL;
     }
 
+    error = define_custom_host_imports(
+        out->linker,
+        out,
+        host_functions,
+        host_function_count
+    );
+    if (error != NULL) {
+        set_error(error_out, error_message(error));
+        wasmtime_kmp_close(out);
+        return NULL;
+    }
+
     /*
      * Open-world Kotlin/Wasm runtime bundles may deliberately shadow host
      * modules with a memory-forwarding adapter after the <kotlin> module has
@@ -1555,6 +1898,29 @@ wasmtime_kmp_instance_t *wasmtime_kmp_instantiate_with_runtime(
     }
 
     return out;
+}
+
+wasmtime_kmp_instance_t *wasmtime_kmp_instantiate_with_runtime(
+    wasmtime_kmp_module_t *module,
+    const wasmtime_kmp_linked_module_t *runtime_modules,
+    size_t runtime_module_count,
+    const wasmtime_kmp_limits_t *limits,
+    const wasmtime_kmp_http_handler_t *http_handler,
+    const wasmtime_kmp_storage_t *storage,
+    char **error_out
+) {
+    return wasmtime_kmp_instantiate_with_runtime_and_imports(
+        module,
+        runtime_modules,
+        runtime_module_count,
+        NULL,
+        0,
+        NULL,
+        limits,
+        http_handler,
+        storage,
+        error_out
+    );
 }
 
 wasmtime_kmp_instance_t *wasmtime_kmp_instantiate_with_capabilities(
@@ -1626,11 +1992,14 @@ wasmtime_kmp_instance_t *wasmtime_kmp_load_with_capabilities(
     return instance;
 }
 
-wasmtime_kmp_instance_t *wasmtime_kmp_load_with_runtime(
+wasmtime_kmp_instance_t *wasmtime_kmp_load_with_runtime_and_imports(
     const uint8_t *wasm,
     size_t wasm_len,
     const wasmtime_kmp_linked_module_t *runtime_modules,
     size_t runtime_module_count,
+    const wasmtime_kmp_host_function_t *host_functions,
+    size_t host_function_count,
+    const wasmtime_kmp_host_imports_t *host_imports,
     const wasmtime_kmp_limits_t *limits,
     const wasmtime_kmp_http_handler_t *http_handler,
     const wasmtime_kmp_storage_t *storage,
@@ -1643,15 +2012,19 @@ wasmtime_kmp_instance_t *wasmtime_kmp_load_with_runtime(
     );
     if (module == NULL) {
         http_handler_dispose_value(http_handler);
+        host_imports_dispose_value(host_imports);
         set_error(error_out, compile_error);
         return NULL;
     }
 
     char *instantiate_error = NULL;
-    wasmtime_kmp_instance_t *instance = wasmtime_kmp_instantiate_with_runtime(
+    wasmtime_kmp_instance_t *instance = wasmtime_kmp_instantiate_with_runtime_and_imports(
         module,
         runtime_modules,
         runtime_module_count,
+        host_functions,
+        host_function_count,
+        host_imports,
         limits,
         http_handler,
         storage,
@@ -1664,6 +2037,31 @@ wasmtime_kmp_instance_t *wasmtime_kmp_load_with_runtime(
     }
     wasmtime_kmp_module_close(module);
     return instance;
+}
+
+wasmtime_kmp_instance_t *wasmtime_kmp_load_with_runtime(
+    const uint8_t *wasm,
+    size_t wasm_len,
+    const wasmtime_kmp_linked_module_t *runtime_modules,
+    size_t runtime_module_count,
+    const wasmtime_kmp_limits_t *limits,
+    const wasmtime_kmp_http_handler_t *http_handler,
+    const wasmtime_kmp_storage_t *storage,
+    char **error_out
+) {
+    return wasmtime_kmp_load_with_runtime_and_imports(
+        wasm,
+        wasm_len,
+        runtime_modules,
+        runtime_module_count,
+        NULL,
+        0,
+        NULL,
+        limits,
+        http_handler,
+        storage,
+        error_out
+    );
 }
 
 wasmtime_kmp_instance_t *wasmtime_kmp_load_with_http(
@@ -2024,6 +2422,444 @@ void wasmtime_kmp_func_i32_2_close(wasmtime_kmp_func_i32_2_t *function) {
     }
 }
 
+
+static int wasmtime_kmp_generic_function_try_retain(wasmtime_kmp_func_t *function) {
+    if (function == NULL || atomic_load_explicit(&function->closed, memory_order_acquire)) return 0;
+    if (!atomic_ref_try_retain(&function->refs)) return 0;
+    if (atomic_load_explicit(&function->closed, memory_order_acquire)) {
+        wasmtime_kmp_generic_function_release(function);
+        return 0;
+    }
+    return 1;
+}
+
+wasmtime_kmp_func_t *wasmtime_kmp_resolve_func(
+    wasmtime_kmp_instance_t *instance,
+    const char *export_name,
+    const int32_t *parameter_kinds,
+    size_t parameter_count,
+    const int32_t *result_kinds,
+    size_t result_count,
+    char **error_out
+) {
+    if (error_out != NULL) *error_out = NULL;
+    if (instance == NULL || export_name == NULL
+        || (parameter_count > 0 && parameter_kinds == NULL)
+        || (result_count > 0 && result_kinds == NULL)) {
+        set_error(error_out, copy_cstr("invalid resolve arguments"));
+        return NULL;
+    }
+    if (!wasmtime_kmp_instance_enter(instance, error_out)) return NULL;
+
+    wasmtime_context_t *context = wasmtime_store_context(instance->store);
+    wasmtime_extern_t item;
+    if (!wasmtime_instance_export_get(
+            context, &instance->instance, export_name, strlen(export_name), &item
+        )) {
+        wasmtime_kmp_instance_leave(instance);
+        set_error(error_out, copy_cstr("export not found"));
+        return NULL;
+    }
+    if (item.kind != WASMTIME_EXTERN_FUNC) {
+        wasmtime_extern_delete(&item);
+        wasmtime_kmp_instance_leave(instance);
+        set_error(error_out, copy_cstr("export is not a function"));
+        return NULL;
+    }
+
+    wasm_functype_t *type = wasmtime_func_type(context, &item.of.func);
+    if (type == NULL) {
+        wasmtime_extern_delete(&item);
+        wasmtime_kmp_instance_leave(instance);
+        set_error(error_out, copy_cstr("failed to inspect function type"));
+        return NULL;
+    }
+    int valid = kmp_function_type_matches(
+        type,
+        parameter_kinds,
+        parameter_count,
+        result_kinds,
+        result_count
+    );
+    wasm_functype_delete(type);
+    if (!valid) {
+        wasmtime_extern_delete(&item);
+        wasmtime_kmp_instance_leave(instance);
+        set_error(error_out, copy_cstr("function signature does not match the requested type"));
+        return NULL;
+    }
+
+    wasmtime_kmp_func_t *out = calloc(1, sizeof(*out));
+    if (out == NULL) {
+        wasmtime_extern_delete(&item);
+        wasmtime_kmp_instance_leave(instance);
+        set_error(error_out, copy_cstr("out of memory"));
+        return NULL;
+    }
+    if (parameter_count > 0) {
+        out->parameter_kinds = malloc(parameter_count * sizeof(int32_t));
+        if (out->parameter_kinds == NULL) {
+            free(out);
+            wasmtime_extern_delete(&item);
+            wasmtime_kmp_instance_leave(instance);
+            set_error(error_out, copy_cstr("out of memory"));
+            return NULL;
+        }
+        memcpy(out->parameter_kinds, parameter_kinds, parameter_count * sizeof(int32_t));
+    }
+    if (result_count > 0) {
+        out->result_kinds = malloc(result_count * sizeof(int32_t));
+        if (out->result_kinds == NULL) {
+            free(out->parameter_kinds);
+            free(out);
+            wasmtime_extern_delete(&item);
+            wasmtime_kmp_instance_leave(instance);
+            set_error(error_out, copy_cstr("out of memory"));
+            return NULL;
+        }
+        memcpy(out->result_kinds, result_kinds, result_count * sizeof(int32_t));
+    }
+    if (!wasmtime_kmp_instance_try_retain(instance)) {
+        free(out->parameter_kinds);
+        free(out->result_kinds);
+        free(out);
+        wasmtime_extern_delete(&item);
+        wasmtime_kmp_instance_leave(instance);
+        set_error(error_out, copy_cstr("Wasmtime instance is closed"));
+        return NULL;
+    }
+
+    atomic_init(&out->refs, 1);
+    atomic_init(&out->closed, 0);
+    out->instance = instance;
+    out->function = item.of.func;
+    out->parameter_count = parameter_count;
+    out->result_count = result_count;
+    wasmtime_extern_delete(&item);
+    wasmtime_kmp_instance_leave(instance);
+    return out;
+}
+
+int wasmtime_kmp_func_call(
+    wasmtime_kmp_func_t *function,
+    const wasmtime_kmp_value_t *arguments,
+    size_t argument_count,
+    wasmtime_kmp_value_t *results,
+    size_t result_count,
+    char **error_out
+) {
+    if (error_out != NULL) *error_out = NULL;
+    if (!wasmtime_kmp_generic_function_try_retain(function)) {
+        set_error(error_out, copy_cstr("Wasmtime function is closed"));
+        return 0;
+    }
+    if (argument_count != function->parameter_count
+        || result_count != function->result_count
+        || (argument_count > 0 && arguments == NULL)
+        || (result_count > 0 && results == NULL)) {
+        wasmtime_kmp_generic_function_release(function);
+        set_error(error_out, copy_cstr("function argument/result count mismatch"));
+        return 0;
+    }
+
+    wasmtime_kmp_instance_t *instance = function->instance;
+    if (!wasmtime_kmp_instance_enter_borrowed(instance, error_out)) {
+        wasmtime_kmp_generic_function_release(function);
+        return 0;
+    }
+
+    wasmtime_val_t *wasm_arguments = argument_count > 0
+        ? calloc(argument_count, sizeof(*wasm_arguments)) : NULL;
+    wasmtime_val_t *wasm_results = result_count > 0
+        ? calloc(result_count, sizeof(*wasm_results)) : NULL;
+    if ((argument_count > 0 && wasm_arguments == NULL)
+        || (result_count > 0 && wasm_results == NULL)) {
+        free(wasm_arguments);
+        free(wasm_results);
+        wasmtime_kmp_instance_leave_borrowed(instance);
+        wasmtime_kmp_generic_function_release(function);
+        set_error(error_out, copy_cstr("out of memory"));
+        return 0;
+    }
+
+    for (size_t index = 0; index < argument_count; index++) {
+        if (!kmp_value_to_wasmtime(
+                &arguments[index], function->parameter_kinds[index], &wasm_arguments[index]
+            )) {
+            free(wasm_arguments);
+            free(wasm_results);
+            wasmtime_kmp_instance_leave_borrowed(instance);
+            wasmtime_kmp_generic_function_release(function);
+            set_error(error_out, copy_cstr("function argument type mismatch"));
+            return 0;
+        }
+    }
+
+    reset_execution_deadline(instance);
+    wasmtime_context_t *context = wasmtime_store_context(instance->store);
+    wasm_trap_t *trap = NULL;
+    wasmtime_error_t *error = wasmtime_func_call(
+        context,
+        &function->function,
+        wasm_arguments,
+        argument_count,
+        wasm_results,
+        result_count,
+        &trap
+    );
+
+    int ok = 1;
+    if (error != NULL) {
+        set_error(error_out, error_message(error));
+        ok = 0;
+    } else if (trap != NULL) {
+        set_error(error_out, trap_message(trap));
+        ok = 0;
+    } else {
+        for (size_t index = 0; index < result_count; index++) {
+            if (!kmp_value_from_wasmtime(&wasm_results[index], &results[index])
+                || results[index].kind != function->result_kinds[index]) {
+                set_error(error_out, copy_cstr("function returned an unexpected result type"));
+                ok = 0;
+                break;
+            }
+        }
+    }
+
+    free(wasm_arguments);
+    free(wasm_results);
+    wasmtime_kmp_instance_leave_borrowed(instance);
+    wasmtime_kmp_generic_function_release(function);
+    return ok;
+}
+
+static void wasmtime_kmp_generic_function_release(wasmtime_kmp_func_t *function) {
+    if (function == NULL) return;
+    if (atomic_fetch_sub_explicit(&function->refs, 1, memory_order_acq_rel) != 1) return;
+    if (function->instance != NULL) wasmtime_kmp_instance_release(function->instance);
+    free(function->parameter_kinds);
+    free(function->result_kinds);
+    free(function);
+}
+
+void wasmtime_kmp_func_close(wasmtime_kmp_func_t *function) {
+    if (function == NULL) return;
+    int expected = 0;
+    if (atomic_compare_exchange_strong_explicit(
+            &function->closed, &expected, 1,
+            memory_order_acq_rel, memory_order_acquire
+        )) {
+        wasmtime_kmp_generic_function_release(function);
+    }
+}
+
+static int instance_export_memory(
+    wasmtime_kmp_instance_t *instance,
+    const char *export_name,
+    wasmtime_context_t **context_out,
+    wasmtime_memory_t *memory_out,
+    char **error_out
+) {
+    wasmtime_context_t *context = wasmtime_store_context(instance->store);
+    wasmtime_extern_t item;
+    if (!wasmtime_instance_export_get(
+            context, &instance->instance, export_name, strlen(export_name), &item
+        )) {
+        set_error(error_out, copy_cstr("memory export not found"));
+        return 0;
+    }
+    if (item.kind != WASMTIME_EXTERN_MEMORY) {
+        wasmtime_extern_delete(&item);
+        set_error(error_out, copy_cstr("export is not a memory"));
+        return 0;
+    }
+    *memory_out = item.of.memory;
+    *context_out = context;
+    wasmtime_extern_delete(&item);
+    return 1;
+}
+
+static int caller_export_memory(
+    wasmtime_kmp_caller_t *caller,
+    const char *export_name,
+    wasmtime_context_t **context_out,
+    wasmtime_memory_t *memory_out,
+    char **error_out
+) {
+    if (caller == NULL || caller->value == NULL) {
+        set_error(error_out, copy_cstr("Wasm caller is unavailable"));
+        return 0;
+    }
+    wasmtime_extern_t item;
+    if (!wasmtime_caller_export_get(
+            caller->value, export_name, strlen(export_name), &item
+        )) {
+        set_error(error_out, copy_cstr("caller memory export not found"));
+        return 0;
+    }
+    if (item.kind != WASMTIME_EXTERN_MEMORY) {
+        wasmtime_extern_delete(&item);
+        set_error(error_out, copy_cstr("caller export is not a memory"));
+        return 0;
+    }
+    *memory_out = item.of.memory;
+    *context_out = wasmtime_caller_context(caller->value);
+    wasmtime_extern_delete(&item);
+    return 1;
+}
+
+static int memory_range(
+    wasmtime_context_t *context,
+    wasmtime_memory_t *memory,
+    size_t offset,
+    size_t length,
+    uint8_t **data_out,
+    char **error_out
+) {
+    size_t size = wasmtime_memory_data_size(context, memory);
+    if (offset > size || length > size - offset) {
+        set_error(error_out, copy_cstr("memory range is out of bounds"));
+        return 0;
+    }
+    uint8_t *data = wasmtime_memory_data(context, memory);
+    if (length > 0 && data == NULL) {
+        set_error(error_out, copy_cstr("memory data is unavailable"));
+        return 0;
+    }
+    *data_out = data + offset;
+    return 1;
+}
+
+int wasmtime_kmp_memory_size(
+    wasmtime_kmp_instance_t *instance,
+    const char *export_name,
+    size_t *size_out,
+    char **error_out
+) {
+    if (error_out != NULL) *error_out = NULL;
+    if (instance == NULL || export_name == NULL || size_out == NULL) {
+        set_error(error_out, copy_cstr("invalid memory arguments"));
+        return 0;
+    }
+    if (!wasmtime_kmp_instance_enter(instance, error_out)) return 0;
+    wasmtime_context_t *context = NULL;
+    wasmtime_memory_t memory;
+    int ok = instance_export_memory(instance, export_name, &context, &memory, error_out);
+    if (ok) *size_out = wasmtime_memory_data_size(context, &memory);
+    wasmtime_kmp_instance_leave(instance);
+    return ok;
+}
+
+int wasmtime_kmp_memory_read(
+    wasmtime_kmp_instance_t *instance,
+    const char *export_name,
+    size_t offset,
+    uint8_t *target,
+    size_t length,
+    char **error_out
+) {
+    if (error_out != NULL) *error_out = NULL;
+    if (instance == NULL || export_name == NULL || (length > 0 && target == NULL)) {
+        set_error(error_out, copy_cstr("invalid memory arguments"));
+        return 0;
+    }
+    if (!wasmtime_kmp_instance_enter(instance, error_out)) return 0;
+    wasmtime_context_t *context = NULL;
+    wasmtime_memory_t memory;
+    uint8_t *data = NULL;
+    int ok = instance_export_memory(instance, export_name, &context, &memory, error_out)
+        && memory_range(context, &memory, offset, length, &data, error_out);
+    if (ok && length > 0) memcpy(target, data, length);
+    wasmtime_kmp_instance_leave(instance);
+    return ok;
+}
+
+int wasmtime_kmp_memory_write(
+    wasmtime_kmp_instance_t *instance,
+    const char *export_name,
+    size_t offset,
+    const uint8_t *source,
+    size_t length,
+    char **error_out
+) {
+    if (error_out != NULL) *error_out = NULL;
+    if (instance == NULL || export_name == NULL || (length > 0 && source == NULL)) {
+        set_error(error_out, copy_cstr("invalid memory arguments"));
+        return 0;
+    }
+    if (!wasmtime_kmp_instance_enter(instance, error_out)) return 0;
+    wasmtime_context_t *context = NULL;
+    wasmtime_memory_t memory;
+    uint8_t *data = NULL;
+    int ok = instance_export_memory(instance, export_name, &context, &memory, error_out)
+        && memory_range(context, &memory, offset, length, &data, error_out);
+    if (ok && length > 0) memcpy(data, source, length);
+    wasmtime_kmp_instance_leave(instance);
+    return ok;
+}
+
+int wasmtime_kmp_caller_memory_size(
+    wasmtime_kmp_caller_t *caller,
+    const char *export_name,
+    size_t *size_out,
+    char **error_out
+) {
+    if (error_out != NULL) *error_out = NULL;
+    if (caller == NULL || export_name == NULL || size_out == NULL) {
+        set_error(error_out, copy_cstr("invalid caller memory arguments"));
+        return 0;
+    }
+    wasmtime_context_t *context = NULL;
+    wasmtime_memory_t memory;
+    int ok = caller_export_memory(caller, export_name, &context, &memory, error_out);
+    if (ok) *size_out = wasmtime_memory_data_size(context, &memory);
+    return ok;
+}
+
+int wasmtime_kmp_caller_memory_read(
+    wasmtime_kmp_caller_t *caller,
+    const char *export_name,
+    size_t offset,
+    uint8_t *target,
+    size_t length,
+    char **error_out
+) {
+    if (error_out != NULL) *error_out = NULL;
+    if (caller == NULL || export_name == NULL || (length > 0 && target == NULL)) {
+        set_error(error_out, copy_cstr("invalid caller memory arguments"));
+        return 0;
+    }
+    wasmtime_context_t *context = NULL;
+    wasmtime_memory_t memory;
+    uint8_t *data = NULL;
+    int ok = caller_export_memory(caller, export_name, &context, &memory, error_out)
+        && memory_range(context, &memory, offset, length, &data, error_out);
+    if (ok && length > 0) memcpy(target, data, length);
+    return ok;
+}
+
+int wasmtime_kmp_caller_memory_write(
+    wasmtime_kmp_caller_t *caller,
+    const char *export_name,
+    size_t offset,
+    const uint8_t *source,
+    size_t length,
+    char **error_out
+) {
+    if (error_out != NULL) *error_out = NULL;
+    if (caller == NULL || export_name == NULL || (length > 0 && source == NULL)) {
+        set_error(error_out, copy_cstr("invalid caller memory arguments"));
+        return 0;
+    }
+    wasmtime_context_t *context = NULL;
+    wasmtime_memory_t memory;
+    uint8_t *data = NULL;
+    int ok = caller_export_memory(caller, export_name, &context, &memory, error_out)
+        && memory_range(context, &memory, offset, length, &data, error_out);
+    if (ok && length > 0) memcpy(data, source, length);
+    return ok;
+}
+
 static void wasmtime_kmp_instance_destroy(wasmtime_kmp_instance_t *instance) {
     http_request_reset(instance);
     if (instance->http_handler.dispose != NULL) {
@@ -2032,6 +2868,17 @@ static void wasmtime_kmp_instance_destroy(wasmtime_kmp_instance_t *instance) {
         instance->http_handler.user_data = NULL;
     }
     if (instance->linker != NULL) wasmtime_linker_delete(instance->linker);
+    if (instance->host_function_envs != NULL) {
+        for (size_t index = 0; index < instance->host_function_env_count; index++) {
+            host_function_env_delete(instance->host_function_envs[index]);
+        }
+        free(instance->host_function_envs);
+    }
+    if (instance->host_imports.dispose != NULL) {
+        instance->host_imports.dispose(instance->host_imports.user_data);
+        instance->host_imports.dispose = NULL;
+        instance->host_imports.user_data = NULL;
+    }
     if (instance->wasi != NULL) wasmtime_kmp_wasi_lite_delete(instance->wasi);
     if (instance->store != NULL) wasmtime_store_delete(instance->store);
     if (instance->module_owner != NULL) {
@@ -2553,6 +3400,289 @@ static int jni_runtime_modules_create(
     return 1;
 }
 
+
+typedef struct wasmtime_kmp_jni_host_functions {
+    jsize count;
+    wasmtime_kmp_host_function_t *functions;
+    char **modules;
+    char **names;
+    int32_t **parameter_kinds;
+    int32_t **result_kinds;
+} wasmtime_kmp_jni_host_functions_t;
+
+static void jni_host_functions_dispose(wasmtime_kmp_jni_host_functions_t *host) {
+    if (host == NULL) return;
+    for (jsize index = 0; index < host->count; index++) {
+        free(host->modules == NULL ? NULL : host->modules[index]);
+        free(host->names == NULL ? NULL : host->names[index]);
+        free(host->parameter_kinds == NULL ? NULL : host->parameter_kinds[index]);
+        free(host->result_kinds == NULL ? NULL : host->result_kinds[index]);
+    }
+    free(host->functions);
+    free(host->modules);
+    free(host->names);
+    free(host->parameter_kinds);
+    free(host->result_kinds);
+    memset(host, 0, sizeof(*host));
+}
+
+static char *jni_copy_string(JNIEnv *env, jstring value) {
+    if (value == NULL) return NULL;
+    const char *chars = (*env)->GetStringUTFChars(env, value, NULL);
+    if (chars == NULL) return NULL;
+    char *copy = copy_cstr(chars);
+    (*env)->ReleaseStringUTFChars(env, value, chars);
+    return copy;
+}
+
+static int32_t *jni_copy_int_array(
+    JNIEnv *env,
+    jintArray array,
+    size_t *count_out
+) {
+    if (array == NULL) return NULL;
+    jsize count = (*env)->GetArrayLength(env, array);
+    *count_out = (size_t) count;
+    if (count == 0) return NULL;
+    int32_t *copy = malloc((size_t) count * sizeof(*copy));
+    if (copy == NULL) return NULL;
+    (*env)->GetIntArrayRegion(env, array, 0, count, (jint *) copy);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        free(copy);
+        return NULL;
+    }
+    return copy;
+}
+
+static int jni_host_functions_create(
+    JNIEnv *env,
+    jobjectArray modules,
+    jobjectArray names,
+    jobjectArray parameter_kinds,
+    jobjectArray result_kinds,
+    wasmtime_kmp_jni_host_functions_t *host
+) {
+    memset(host, 0, sizeof(*host));
+    if (modules == NULL || names == NULL || parameter_kinds == NULL || result_kinds == NULL) return 0;
+    jsize count = (*env)->GetArrayLength(env, modules);
+    if ((*env)->GetArrayLength(env, names) != count
+        || (*env)->GetArrayLength(env, parameter_kinds) != count
+        || (*env)->GetArrayLength(env, result_kinds) != count) {
+        return 0;
+    }
+    host->count = count;
+    if (count == 0) return 1;
+
+    host->functions = calloc((size_t) count, sizeof(*host->functions));
+    host->modules = calloc((size_t) count, sizeof(*host->modules));
+    host->names = calloc((size_t) count, sizeof(*host->names));
+    host->parameter_kinds = calloc((size_t) count, sizeof(*host->parameter_kinds));
+    host->result_kinds = calloc((size_t) count, sizeof(*host->result_kinds));
+    if (host->functions == NULL || host->modules == NULL || host->names == NULL
+        || host->parameter_kinds == NULL || host->result_kinds == NULL) {
+        jni_host_functions_dispose(host);
+        return 0;
+    }
+
+    for (jsize index = 0; index < count; index++) {
+        jstring module = (jstring) (*env)->GetObjectArrayElement(env, modules, index);
+        jstring name = (jstring) (*env)->GetObjectArrayElement(env, names, index);
+        jintArray params = (jintArray) (*env)->GetObjectArrayElement(env, parameter_kinds, index);
+        jintArray results = (jintArray) (*env)->GetObjectArrayElement(env, result_kinds, index);
+        if (module == NULL || name == NULL || params == NULL || results == NULL) {
+            if (module != NULL) (*env)->DeleteLocalRef(env, module);
+            if (name != NULL) (*env)->DeleteLocalRef(env, name);
+            if (params != NULL) (*env)->DeleteLocalRef(env, params);
+            if (results != NULL) (*env)->DeleteLocalRef(env, results);
+            jni_host_functions_dispose(host);
+            return 0;
+        }
+
+        host->modules[index] = jni_copy_string(env, module);
+        host->names[index] = jni_copy_string(env, name);
+        size_t param_count = 0;
+        size_t result_count = 0;
+        host->parameter_kinds[index] = jni_copy_int_array(env, params, &param_count);
+        host->result_kinds[index] = jni_copy_int_array(env, results, &result_count);
+
+        (*env)->DeleteLocalRef(env, module);
+        (*env)->DeleteLocalRef(env, name);
+        (*env)->DeleteLocalRef(env, params);
+        (*env)->DeleteLocalRef(env, results);
+
+        if (host->modules[index] == NULL || host->names[index] == NULL
+            || (param_count > 0 && host->parameter_kinds[index] == NULL)
+            || (result_count > 0 && host->result_kinds[index] == NULL)) {
+            jni_host_functions_dispose(host);
+            return 0;
+        }
+
+        host->functions[index].module = host->modules[index];
+        host->functions[index].name = host->names[index];
+        host->functions[index].parameter_kinds = host->parameter_kinds[index];
+        host->functions[index].parameter_count = param_count;
+        host->functions[index].result_kinds = host->result_kinds[index];
+        host->functions[index].result_count = result_count;
+        host->functions[index].function_index = (size_t) index;
+    }
+    return 1;
+}
+
+typedef struct wasmtime_kmp_jni_import_state {
+    JavaVM *vm;
+    jobject bridge;
+} wasmtime_kmp_jni_import_state_t;
+
+static int jni_import_invoke(
+    void *user_data,
+    size_t function_index,
+    wasmtime_kmp_caller_t *caller,
+    const wasmtime_kmp_value_t *arguments,
+    size_t argument_count,
+    wasmtime_kmp_value_t *results,
+    size_t result_count,
+    char **error_out
+) {
+    wasmtime_kmp_jni_import_state_t *state = user_data;
+    JNIEnv *env = NULL;
+    int attached = 0;
+    jclass bridge_class = NULL;
+    jlongArray java_arguments = NULL;
+    jlongArray java_results = NULL;
+    jstring java_error = NULL;
+    int ok = 0;
+
+    if (error_out != NULL) *error_out = NULL;
+    if (state == NULL || state->bridge == NULL || !jni_get_env(state->vm, &env, &attached)) {
+        set_error(error_out, copy_cstr("JNI host import bridge is unavailable"));
+        goto done;
+    }
+
+    bridge_class = (*env)->GetObjectClass(env, state->bridge);
+    if (bridge_class == NULL) goto java_failure;
+    jmethodID invoke = (*env)->GetMethodID(env, bridge_class, "invoke", "(IJ[J)[J");
+    jmethodID consume_error = (*env)->GetMethodID(
+        env, bridge_class, "consumeError", "()Ljava/lang/String;"
+    );
+    if (invoke == NULL || consume_error == NULL) goto java_failure;
+
+    java_arguments = (*env)->NewLongArray(env, (jsize) argument_count);
+    if (java_arguments == NULL) goto java_failure;
+    if (argument_count > 0) {
+        jlong *bits = malloc(argument_count * sizeof(*bits));
+        if (bits == NULL) {
+            set_error(error_out, copy_cstr("out of memory"));
+            goto done;
+        }
+        for (size_t index = 0; index < argument_count; index++) {
+            bits[index] = (jlong) arguments[index].bits;
+        }
+        (*env)->SetLongArrayRegion(env, java_arguments, 0, (jsize) argument_count, bits);
+        free(bits);
+        if ((*env)->ExceptionCheck(env)) goto java_failure;
+    }
+
+    java_results = (jlongArray) (*env)->CallObjectMethod(
+        env,
+        state->bridge,
+        invoke,
+        (jint) function_index,
+        (jlong) (intptr_t) caller,
+        java_arguments
+    );
+    if ((*env)->ExceptionCheck(env)) goto java_failure;
+
+    if (java_results == NULL) {
+        java_error = (jstring) (*env)->CallObjectMethod(env, state->bridge, consume_error);
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+        } else if (java_error != NULL) {
+            const char *chars = (*env)->GetStringUTFChars(env, java_error, NULL);
+            if (chars != NULL) {
+                set_error(error_out, copy_cstr(chars));
+                (*env)->ReleaseStringUTFChars(env, java_error, chars);
+            }
+        }
+        if (error_out != NULL && *error_out == NULL) {
+            set_error(error_out, copy_cstr("host import callback failed"));
+        }
+        goto done;
+    }
+
+    if ((*env)->GetArrayLength(env, java_results) != (jsize) result_count) {
+        set_error(error_out, copy_cstr("host import result count mismatch"));
+        goto done;
+    }
+    if (result_count > 0) {
+        jlong *bits = malloc(result_count * sizeof(*bits));
+        if (bits == NULL) {
+            set_error(error_out, copy_cstr("out of memory"));
+            goto done;
+        }
+        (*env)->GetLongArrayRegion(env, java_results, 0, (jsize) result_count, bits);
+        if ((*env)->ExceptionCheck(env)) {
+            free(bits);
+            goto java_failure;
+        }
+        for (size_t index = 0; index < result_count; index++) {
+            results[index].bits = (uint64_t) bits[index];
+        }
+        free(bits);
+    }
+    ok = 1;
+    goto done;
+
+java_failure:
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    set_error(error_out, copy_cstr("JNI host import callback failed"));
+
+done:
+    if (java_error != NULL) (*env)->DeleteLocalRef(env, java_error);
+    if (java_results != NULL) (*env)->DeleteLocalRef(env, java_results);
+    if (java_arguments != NULL) (*env)->DeleteLocalRef(env, java_arguments);
+    if (bridge_class != NULL) (*env)->DeleteLocalRef(env, bridge_class);
+    if (env != NULL && attached) (*state->vm)->DetachCurrentThread(state->vm);
+    return ok;
+}
+
+static void jni_import_dispose(void *user_data) {
+    wasmtime_kmp_jni_import_state_t *state = user_data;
+    if (state == NULL) return;
+    JNIEnv *env = NULL;
+    int attached = 0;
+    if (jni_get_env(state->vm, &env, &attached)) {
+        if (state->bridge != NULL) (*env)->DeleteGlobalRef(env, state->bridge);
+        if (attached) (*state->vm)->DetachCurrentThread(state->vm);
+    }
+    free(state);
+}
+
+static int jni_import_handler_create(
+    JNIEnv *env,
+    jobject bridge,
+    wasmtime_kmp_host_imports_t *imports_out
+) {
+    memset(imports_out, 0, sizeof(*imports_out));
+    if (bridge == NULL) return 1;
+
+    wasmtime_kmp_jni_import_state_t *state = calloc(1, sizeof(*state));
+    if (state == NULL) return 0;
+    if ((*env)->GetJavaVM(env, &state->vm) != JNI_OK) {
+        free(state);
+        return 0;
+    }
+    state->bridge = (*env)->NewGlobalRef(env, bridge);
+    if (state->bridge == NULL) {
+        free(state);
+        return 0;
+    }
+    imports_out->user_data = state;
+    imports_out->invoke = jni_import_invoke;
+    imports_out->dispose = jni_import_dispose;
+    return 1;
+}
+
 JNIEXPORT void JNICALL
 Java_dev_brahmkshatriya_wasmtime_internal_NativeWasmtime_nativeSetDefaultCacheDirectory(
     JNIEnv *env,
@@ -2967,6 +4097,671 @@ Java_dev_brahmkshatriya_wasmtime_internal_NativeWasmtime_nativeLoadWithRuntime(
         return 0;
     }
     return (jlong) (intptr_t) instance;
+}
+
+
+JNIEXPORT jlong JNICALL
+Java_dev_brahmkshatriya_wasmtime_internal_NativeWasmtime_nativeInstantiateWithRuntimeAndImports(
+    JNIEnv *env,
+    jclass clazz,
+    jlong module_handle,
+    jobjectArray runtime_module_names,
+    jobjectArray runtime_modules,
+    jobjectArray import_modules,
+    jobjectArray import_names,
+    jobjectArray import_parameter_kinds,
+    jobjectArray import_result_kinds,
+    jobject imports_bridge,
+    jlong max_memory_bytes,
+    jlong fuel,
+    jlong max_execution_millis,
+    jlong max_table_elements,
+    jint max_host_call_bytes,
+    jlong max_output_bytes,
+    jint max_http_response_bytes,
+    jlong max_wasi_poll_millis,
+    jobject http_handler,
+    jstring storage_backing_path,
+    jstring storage_guest_path,
+    jboolean storage_read_only,
+    jlong storage_max_bytes,
+    jint storage_max_entries,
+    jlong storage_max_file_bytes
+) {
+    (void) clazz;
+    wasmtime_kmp_jni_runtime_modules_t native_runtime = {0};
+    wasmtime_kmp_jni_host_functions_t native_host = {0};
+    if (!jni_runtime_modules_create(env, runtime_module_names, runtime_modules, &native_runtime)) {
+        throw_illegal_state(env, "failed to create runtime module bridge");
+        return 0;
+    }
+    if (!jni_host_functions_create(
+            env,
+            import_modules,
+            import_names,
+            import_parameter_kinds,
+            import_result_kinds,
+            &native_host
+        )) {
+        jni_runtime_modules_dispose(env, &native_runtime);
+        throw_illegal_state(env, "failed to create host import descriptors");
+        return 0;
+    }
+
+    wasmtime_kmp_http_handler_t native_http_handler = {0};
+    if (!jni_http_handler_create(env, http_handler, &native_http_handler)) {
+        jni_host_functions_dispose(&native_host);
+        jni_runtime_modules_dispose(env, &native_runtime);
+        throw_illegal_state(env, "failed to create HTTP handler bridge");
+        return 0;
+    }
+    wasmtime_kmp_host_imports_t native_imports = {0};
+    if (!jni_import_handler_create(env, imports_bridge, &native_imports)) {
+        if (native_http_handler.dispose != NULL) {
+            native_http_handler.dispose(native_http_handler.user_data);
+        }
+        jni_host_functions_dispose(&native_host);
+        jni_runtime_modules_dispose(env, &native_runtime);
+        throw_illegal_state(env, "failed to create host import bridge");
+        return 0;
+    }
+
+    const char *storage_backing = storage_backing_path == NULL
+        ? NULL : (*env)->GetStringUTFChars(env, storage_backing_path, NULL);
+    const char *storage_guest = storage_guest_path == NULL
+        ? NULL : (*env)->GetStringUTFChars(env, storage_guest_path, NULL);
+    wasmtime_kmp_storage_t native_storage = {
+        .backing_path = storage_backing,
+        .guest_path = storage_guest,
+        .read_only = storage_read_only == JNI_TRUE,
+        .max_bytes = (int64_t) storage_max_bytes,
+        .max_entries = (int64_t) storage_max_entries,
+        .max_file_bytes = (int64_t) storage_max_file_bytes,
+    };
+    const wasmtime_kmp_storage_t *storage_ptr =
+        storage_backing_path == NULL ? NULL : &native_storage;
+    const wasmtime_kmp_http_handler_t *http_handler_ptr =
+        http_handler == NULL ? NULL : &native_http_handler;
+    const wasmtime_kmp_host_imports_t *imports_ptr =
+        imports_bridge == NULL ? NULL : &native_imports;
+
+    wasmtime_kmp_limits_t limits = {
+        .max_memory_bytes = (int64_t) max_memory_bytes,
+        .fuel = (uint64_t) fuel,
+        .max_execution_millis = (int64_t) max_execution_millis,
+        .max_table_elements = (int64_t) max_table_elements,
+        .max_host_call_bytes = (int64_t) max_host_call_bytes,
+        .max_output_bytes = (int64_t) max_output_bytes,
+        .max_http_response_bytes = (int64_t) max_http_response_bytes,
+        .max_wasi_poll_millis = (int64_t) max_wasi_poll_millis,
+    };
+
+    char *error = NULL;
+    wasmtime_kmp_instance_t *instance = wasmtime_kmp_instantiate_with_runtime_and_imports(
+        (wasmtime_kmp_module_t *) (intptr_t) module_handle,
+        native_runtime.modules,
+        (size_t) native_runtime.count,
+        native_host.functions,
+        (size_t) native_host.count,
+        imports_ptr,
+        &limits,
+        http_handler_ptr,
+        storage_ptr,
+        &error
+    );
+
+    if (storage_backing != NULL) {
+        (*env)->ReleaseStringUTFChars(env, storage_backing_path, storage_backing);
+    }
+    if (storage_guest != NULL) {
+        (*env)->ReleaseStringUTFChars(env, storage_guest_path, storage_guest);
+    }
+    jni_host_functions_dispose(&native_host);
+    jni_runtime_modules_dispose(env, &native_runtime);
+
+    if (instance == NULL) {
+        throw_illegal_state(env, error);
+        wasmtime_kmp_string_free(error);
+        return 0;
+    }
+    return (jlong) (intptr_t) instance;
+}
+
+JNIEXPORT jlong JNICALL
+Java_dev_brahmkshatriya_wasmtime_internal_NativeWasmtime_nativeLoadWithRuntimeAndImports(
+    JNIEnv *env,
+    jclass clazz,
+    jbyteArray wasm,
+    jobjectArray runtime_module_names,
+    jobjectArray runtime_modules,
+    jobjectArray import_modules,
+    jobjectArray import_names,
+    jobjectArray import_parameter_kinds,
+    jobjectArray import_result_kinds,
+    jobject imports_bridge,
+    jlong max_memory_bytes,
+    jlong fuel,
+    jlong max_execution_millis,
+    jlong max_table_elements,
+    jint max_host_call_bytes,
+    jlong max_output_bytes,
+    jint max_http_response_bytes,
+    jlong max_wasi_poll_millis,
+    jobject http_handler,
+    jstring storage_backing_path,
+    jstring storage_guest_path,
+    jboolean storage_read_only,
+    jlong storage_max_bytes,
+    jint storage_max_entries,
+    jlong storage_max_file_bytes
+) {
+    (void) clazz;
+    jsize wasm_size = (*env)->GetArrayLength(env, wasm);
+    jbyte *wasm_bytes = (*env)->GetByteArrayElements(env, wasm, NULL);
+    if (wasm_bytes == NULL) return 0;
+
+    wasmtime_kmp_jni_runtime_modules_t native_runtime = {0};
+    wasmtime_kmp_jni_host_functions_t native_host = {0};
+    if (!jni_runtime_modules_create(env, runtime_module_names, runtime_modules, &native_runtime)) {
+        (*env)->ReleaseByteArrayElements(env, wasm, wasm_bytes, JNI_ABORT);
+        throw_illegal_state(env, "failed to create runtime module bridge");
+        return 0;
+    }
+    if (!jni_host_functions_create(
+            env,
+            import_modules,
+            import_names,
+            import_parameter_kinds,
+            import_result_kinds,
+            &native_host
+        )) {
+        jni_runtime_modules_dispose(env, &native_runtime);
+        (*env)->ReleaseByteArrayElements(env, wasm, wasm_bytes, JNI_ABORT);
+        throw_illegal_state(env, "failed to create host import descriptors");
+        return 0;
+    }
+
+    wasmtime_kmp_http_handler_t native_http_handler = {0};
+    if (!jni_http_handler_create(env, http_handler, &native_http_handler)) {
+        jni_host_functions_dispose(&native_host);
+        jni_runtime_modules_dispose(env, &native_runtime);
+        (*env)->ReleaseByteArrayElements(env, wasm, wasm_bytes, JNI_ABORT);
+        throw_illegal_state(env, "failed to create HTTP handler bridge");
+        return 0;
+    }
+    wasmtime_kmp_host_imports_t native_imports = {0};
+    if (!jni_import_handler_create(env, imports_bridge, &native_imports)) {
+        if (native_http_handler.dispose != NULL) {
+            native_http_handler.dispose(native_http_handler.user_data);
+        }
+        jni_host_functions_dispose(&native_host);
+        jni_runtime_modules_dispose(env, &native_runtime);
+        (*env)->ReleaseByteArrayElements(env, wasm, wasm_bytes, JNI_ABORT);
+        throw_illegal_state(env, "failed to create host import bridge");
+        return 0;
+    }
+
+    const char *storage_backing = storage_backing_path == NULL
+        ? NULL : (*env)->GetStringUTFChars(env, storage_backing_path, NULL);
+    const char *storage_guest = storage_guest_path == NULL
+        ? NULL : (*env)->GetStringUTFChars(env, storage_guest_path, NULL);
+    wasmtime_kmp_storage_t native_storage = {
+        .backing_path = storage_backing,
+        .guest_path = storage_guest,
+        .read_only = storage_read_only == JNI_TRUE,
+        .max_bytes = (int64_t) storage_max_bytes,
+        .max_entries = (int64_t) storage_max_entries,
+        .max_file_bytes = (int64_t) storage_max_file_bytes,
+    };
+    const wasmtime_kmp_storage_t *storage_ptr =
+        storage_backing_path == NULL ? NULL : &native_storage;
+    const wasmtime_kmp_http_handler_t *http_handler_ptr =
+        http_handler == NULL ? NULL : &native_http_handler;
+    const wasmtime_kmp_host_imports_t *imports_ptr =
+        imports_bridge == NULL ? NULL : &native_imports;
+
+    wasmtime_kmp_limits_t limits = {
+        .max_memory_bytes = (int64_t) max_memory_bytes,
+        .fuel = (uint64_t) fuel,
+        .max_execution_millis = (int64_t) max_execution_millis,
+        .max_table_elements = (int64_t) max_table_elements,
+        .max_host_call_bytes = (int64_t) max_host_call_bytes,
+        .max_output_bytes = (int64_t) max_output_bytes,
+        .max_http_response_bytes = (int64_t) max_http_response_bytes,
+        .max_wasi_poll_millis = (int64_t) max_wasi_poll_millis,
+    };
+
+    char *error = NULL;
+    wasmtime_kmp_instance_t *instance = wasmtime_kmp_load_with_runtime_and_imports(
+        (const uint8_t *) wasm_bytes,
+        (size_t) wasm_size,
+        native_runtime.modules,
+        (size_t) native_runtime.count,
+        native_host.functions,
+        (size_t) native_host.count,
+        imports_ptr,
+        &limits,
+        http_handler_ptr,
+        storage_ptr,
+        &error
+    );
+
+    if (storage_backing != NULL) {
+        (*env)->ReleaseStringUTFChars(env, storage_backing_path, storage_backing);
+    }
+    if (storage_guest != NULL) {
+        (*env)->ReleaseStringUTFChars(env, storage_guest_path, storage_guest);
+    }
+    jni_host_functions_dispose(&native_host);
+    jni_runtime_modules_dispose(env, &native_runtime);
+    (*env)->ReleaseByteArrayElements(env, wasm, wasm_bytes, JNI_ABORT);
+
+    if (instance == NULL) {
+        throw_illegal_state(env, error);
+        wasmtime_kmp_string_free(error);
+        return 0;
+    }
+    return (jlong) (intptr_t) instance;
+}
+
+
+JNIEXPORT jlong JNICALL
+Java_dev_brahmkshatriya_wasmtime_internal_NativeWasmtime_nativeResolveFunction(
+    JNIEnv *env,
+    jclass clazz,
+    jlong instance_handle,
+    jstring export_name,
+    jintArray parameter_kinds,
+    jintArray result_kinds
+) {
+    (void) clazz;
+    const char *name = (*env)->GetStringUTFChars(env, export_name, NULL);
+    if (name == NULL) return 0;
+
+    jsize parameter_count = (*env)->GetArrayLength(env, parameter_kinds);
+    jsize result_count = (*env)->GetArrayLength(env, result_kinds);
+    jint *parameters = parameter_count > 0
+        ? (*env)->GetIntArrayElements(env, parameter_kinds, NULL) : NULL;
+    jint *results = result_count > 0
+        ? (*env)->GetIntArrayElements(env, result_kinds, NULL) : NULL;
+    if ((parameter_count > 0 && parameters == NULL)
+        || (result_count > 0 && results == NULL)) {
+        if (parameters != NULL) {
+            (*env)->ReleaseIntArrayElements(env, parameter_kinds, parameters, JNI_ABORT);
+        }
+        if (results != NULL) {
+            (*env)->ReleaseIntArrayElements(env, result_kinds, results, JNI_ABORT);
+        }
+        (*env)->ReleaseStringUTFChars(env, export_name, name);
+        return 0;
+    }
+
+    char *error = NULL;
+    wasmtime_kmp_func_t *function = wasmtime_kmp_resolve_func(
+        (wasmtime_kmp_instance_t *) (intptr_t) instance_handle,
+        name,
+        (const int32_t *) parameters,
+        (size_t) parameter_count,
+        (const int32_t *) results,
+        (size_t) result_count,
+        &error
+    );
+
+    if (parameters != NULL) {
+        (*env)->ReleaseIntArrayElements(env, parameter_kinds, parameters, JNI_ABORT);
+    }
+    if (results != NULL) {
+        (*env)->ReleaseIntArrayElements(env, result_kinds, results, JNI_ABORT);
+    }
+    (*env)->ReleaseStringUTFChars(env, export_name, name);
+
+    if (function == NULL) {
+        throw_illegal_state(env, error);
+        wasmtime_kmp_string_free(error);
+        return 0;
+    }
+    return (jlong) (intptr_t) function;
+}
+
+JNIEXPORT jlongArray JNICALL
+Java_dev_brahmkshatriya_wasmtime_internal_NativeWasmtime_nativeCallResolvedFunction(
+    JNIEnv *env,
+    jclass clazz,
+    jlong function_handle,
+    jlongArray argument_bits
+) {
+    (void) clazz;
+    wasmtime_kmp_func_t *function =
+        (wasmtime_kmp_func_t *) (intptr_t) function_handle;
+    if (function == NULL) {
+        throw_illegal_state(env, "Wasmtime function is closed");
+        return NULL;
+    }
+
+    jsize argument_count = (*env)->GetArrayLength(env, argument_bits);
+    if ((size_t) argument_count != function->parameter_count) {
+        throw_illegal_state(env, "function argument count mismatch");
+        return NULL;
+    }
+
+    wasmtime_kmp_value_t *arguments = argument_count > 0
+        ? calloc((size_t) argument_count, sizeof(*arguments)) : NULL;
+    wasmtime_kmp_value_t *results = function->result_count > 0
+        ? calloc(function->result_count, sizeof(*results)) : NULL;
+    if ((argument_count > 0 && arguments == NULL)
+        || (function->result_count > 0 && results == NULL)) {
+        free(arguments);
+        free(results);
+        throw_illegal_state(env, "out of memory");
+        return NULL;
+    }
+
+    if (argument_count > 0) {
+        jlong *bits = (*env)->GetLongArrayElements(env, argument_bits, NULL);
+        if (bits == NULL) {
+            free(arguments);
+            free(results);
+            return NULL;
+        }
+        for (jsize index = 0; index < argument_count; index++) {
+            arguments[index].kind = function->parameter_kinds[index];
+            arguments[index].bits = (uint64_t) bits[index];
+        }
+        (*env)->ReleaseLongArrayElements(env, argument_bits, bits, JNI_ABORT);
+    }
+
+    char *error = NULL;
+    int ok = wasmtime_kmp_func_call(
+        function,
+        arguments,
+        (size_t) argument_count,
+        results,
+        function->result_count,
+        &error
+    );
+    free(arguments);
+    if (!ok) {
+        free(results);
+        throw_illegal_state(env, error);
+        wasmtime_kmp_string_free(error);
+        return NULL;
+    }
+
+    jlongArray out = (*env)->NewLongArray(env, (jsize) function->result_count);
+    if (out == NULL) {
+        free(results);
+        return NULL;
+    }
+    if (function->result_count > 0) {
+        jlong *bits = malloc(function->result_count * sizeof(*bits));
+        if (bits == NULL) {
+            free(results);
+            (*env)->DeleteLocalRef(env, out);
+            throw_illegal_state(env, "out of memory");
+            return NULL;
+        }
+        for (size_t index = 0; index < function->result_count; index++) {
+            bits[index] = (jlong) results[index].bits;
+        }
+        (*env)->SetLongArrayRegion(env, out, 0, (jsize) function->result_count, bits);
+        free(bits);
+    }
+    free(results);
+    return out;
+}
+
+JNIEXPORT void JNICALL
+Java_dev_brahmkshatriya_wasmtime_internal_NativeWasmtime_nativeGenericFunctionClose(
+    JNIEnv *env,
+    jclass clazz,
+    jlong function_handle
+) {
+    (void) env;
+    (void) clazz;
+    wasmtime_kmp_func_close((wasmtime_kmp_func_t *) (intptr_t) function_handle);
+}
+
+static jint jni_memory_size(
+    JNIEnv *env,
+    wasmtime_kmp_instance_t *instance,
+    const char *name
+) {
+    size_t size = 0;
+    char *error = NULL;
+    if (!wasmtime_kmp_memory_size(instance, name, &size, &error)) {
+        throw_illegal_state(env, error);
+        wasmtime_kmp_string_free(error);
+        return 0;
+    }
+    if (size > INT32_MAX) {
+        throw_illegal_state(env, "Wasm memory is too large for JVM ByteArray access");
+        return 0;
+    }
+    return (jint) size;
+}
+
+JNIEXPORT jint JNICALL
+Java_dev_brahmkshatriya_wasmtime_internal_NativeWasmtime_nativeMemorySize(
+    JNIEnv *env,
+    jclass clazz,
+    jlong instance_handle,
+    jstring export_name
+) {
+    (void) clazz;
+    const char *name = (*env)->GetStringUTFChars(env, export_name, NULL);
+    if (name == NULL) return 0;
+    jint size = jni_memory_size(
+        env,
+        (wasmtime_kmp_instance_t *) (intptr_t) instance_handle,
+        name
+    );
+    (*env)->ReleaseStringUTFChars(env, export_name, name);
+    return size;
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_dev_brahmkshatriya_wasmtime_internal_NativeWasmtime_nativeMemoryRead(
+    JNIEnv *env,
+    jclass clazz,
+    jlong instance_handle,
+    jstring export_name,
+    jint offset,
+    jint length
+) {
+    (void) clazz;
+    if (offset < 0 || length < 0) {
+        throw_illegal_state(env, "memory offset/length must be non-negative");
+        return NULL;
+    }
+    const char *name = (*env)->GetStringUTFChars(env, export_name, NULL);
+    if (name == NULL) return NULL;
+    jbyteArray out = (*env)->NewByteArray(env, length);
+    if (out == NULL) {
+        (*env)->ReleaseStringUTFChars(env, export_name, name);
+        return NULL;
+    }
+
+    jbyte *bytes = length > 0 ? (*env)->GetByteArrayElements(env, out, NULL) : NULL;
+    if (length > 0 && bytes == NULL) {
+        (*env)->ReleaseStringUTFChars(env, export_name, name);
+        (*env)->DeleteLocalRef(env, out);
+        return NULL;
+    }
+
+    char *error = NULL;
+    int ok = wasmtime_kmp_memory_read(
+        (wasmtime_kmp_instance_t *) (intptr_t) instance_handle,
+        name,
+        (size_t) offset,
+        (uint8_t *) bytes,
+        (size_t) length,
+        &error
+    );
+    if (bytes != NULL) (*env)->ReleaseByteArrayElements(env, out, bytes, 0);
+    (*env)->ReleaseStringUTFChars(env, export_name, name);
+    if (!ok) {
+        (*env)->DeleteLocalRef(env, out);
+        throw_illegal_state(env, error);
+        wasmtime_kmp_string_free(error);
+        return NULL;
+    }
+    return out;
+}
+
+JNIEXPORT void JNICALL
+Java_dev_brahmkshatriya_wasmtime_internal_NativeWasmtime_nativeMemoryWrite(
+    JNIEnv *env,
+    jclass clazz,
+    jlong instance_handle,
+    jstring export_name,
+    jint offset,
+    jbyteArray source
+) {
+    (void) clazz;
+    if (offset < 0) {
+        throw_illegal_state(env, "memory offset must be non-negative");
+        return;
+    }
+    const char *name = (*env)->GetStringUTFChars(env, export_name, NULL);
+    if (name == NULL) return;
+    jsize length = (*env)->GetArrayLength(env, source);
+    jbyte *bytes = length > 0 ? (*env)->GetByteArrayElements(env, source, NULL) : NULL;
+    if (length > 0 && bytes == NULL) {
+        (*env)->ReleaseStringUTFChars(env, export_name, name);
+        return;
+    }
+    char *error = NULL;
+    int ok = wasmtime_kmp_memory_write(
+        (wasmtime_kmp_instance_t *) (intptr_t) instance_handle,
+        name,
+        (size_t) offset,
+        (const uint8_t *) bytes,
+        (size_t) length,
+        &error
+    );
+    if (bytes != NULL) (*env)->ReleaseByteArrayElements(env, source, bytes, JNI_ABORT);
+    (*env)->ReleaseStringUTFChars(env, export_name, name);
+    if (!ok) {
+        throw_illegal_state(env, error);
+        wasmtime_kmp_string_free(error);
+    }
+}
+
+JNIEXPORT jint JNICALL
+Java_dev_brahmkshatriya_wasmtime_internal_NativeWasmtime_nativeCallerMemorySize(
+    JNIEnv *env,
+    jclass clazz,
+    jlong caller_handle,
+    jstring export_name
+) {
+    (void) clazz;
+    const char *name = (*env)->GetStringUTFChars(env, export_name, NULL);
+    if (name == NULL) return 0;
+    size_t size = 0;
+    char *error = NULL;
+    int ok = wasmtime_kmp_caller_memory_size(
+        (wasmtime_kmp_caller_t *) (intptr_t) caller_handle,
+        name,
+        &size,
+        &error
+    );
+    (*env)->ReleaseStringUTFChars(env, export_name, name);
+    if (!ok) {
+        throw_illegal_state(env, error);
+        wasmtime_kmp_string_free(error);
+        return 0;
+    }
+    if (size > INT32_MAX) {
+        throw_illegal_state(env, "Wasm memory is too large for JVM ByteArray access");
+        return 0;
+    }
+    return (jint) size;
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_dev_brahmkshatriya_wasmtime_internal_NativeWasmtime_nativeCallerMemoryRead(
+    JNIEnv *env,
+    jclass clazz,
+    jlong caller_handle,
+    jstring export_name,
+    jint offset,
+    jint length
+) {
+    (void) clazz;
+    if (offset < 0 || length < 0) {
+        throw_illegal_state(env, "memory offset/length must be non-negative");
+        return NULL;
+    }
+    const char *name = (*env)->GetStringUTFChars(env, export_name, NULL);
+    if (name == NULL) return NULL;
+    jbyteArray out = (*env)->NewByteArray(env, length);
+    if (out == NULL) {
+        (*env)->ReleaseStringUTFChars(env, export_name, name);
+        return NULL;
+    }
+    jbyte *bytes = length > 0 ? (*env)->GetByteArrayElements(env, out, NULL) : NULL;
+    if (length > 0 && bytes == NULL) {
+        (*env)->ReleaseStringUTFChars(env, export_name, name);
+        (*env)->DeleteLocalRef(env, out);
+        return NULL;
+    }
+    char *error = NULL;
+    int ok = wasmtime_kmp_caller_memory_read(
+        (wasmtime_kmp_caller_t *) (intptr_t) caller_handle,
+        name,
+        (size_t) offset,
+        (uint8_t *) bytes,
+        (size_t) length,
+        &error
+    );
+    if (bytes != NULL) (*env)->ReleaseByteArrayElements(env, out, bytes, 0);
+    (*env)->ReleaseStringUTFChars(env, export_name, name);
+    if (!ok) {
+        (*env)->DeleteLocalRef(env, out);
+        throw_illegal_state(env, error);
+        wasmtime_kmp_string_free(error);
+        return NULL;
+    }
+    return out;
+}
+
+JNIEXPORT void JNICALL
+Java_dev_brahmkshatriya_wasmtime_internal_NativeWasmtime_nativeCallerMemoryWrite(
+    JNIEnv *env,
+    jclass clazz,
+    jlong caller_handle,
+    jstring export_name,
+    jint offset,
+    jbyteArray source
+) {
+    (void) clazz;
+    if (offset < 0) {
+        throw_illegal_state(env, "memory offset must be non-negative");
+        return;
+    }
+    const char *name = (*env)->GetStringUTFChars(env, export_name, NULL);
+    if (name == NULL) return;
+    jsize length = (*env)->GetArrayLength(env, source);
+    jbyte *bytes = length > 0 ? (*env)->GetByteArrayElements(env, source, NULL) : NULL;
+    if (length > 0 && bytes == NULL) {
+        (*env)->ReleaseStringUTFChars(env, export_name, name);
+        return;
+    }
+    char *error = NULL;
+    int ok = wasmtime_kmp_caller_memory_write(
+        (wasmtime_kmp_caller_t *) (intptr_t) caller_handle,
+        name,
+        (size_t) offset,
+        (const uint8_t *) bytes,
+        (size_t) length,
+        &error
+    );
+    if (bytes != NULL) (*env)->ReleaseByteArrayElements(env, source, bytes, JNI_ABORT);
+    (*env)->ReleaseStringUTFChars(env, export_name, name);
+    if (!ok) {
+        throw_illegal_state(env, error);
+        wasmtime_kmp_string_free(error);
+    }
 }
 
 JNIEXPORT jint JNICALL

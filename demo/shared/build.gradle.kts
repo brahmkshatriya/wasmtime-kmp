@@ -38,6 +38,7 @@ kotlin {
     sourceSets.commonMain.dependencies {
         api(libs.kotlin.coroutines.core)
         api(libs.kotlin.serialization.json)
+        api(libs.kotlin.serialization.cbor)
     }
 
 }

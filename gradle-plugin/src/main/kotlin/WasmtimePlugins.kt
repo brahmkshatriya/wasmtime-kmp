@@ -35,6 +35,8 @@ private val SDK_VERSION: String =
     WasmtimeExtensionPlugin::class.java.`package`.implementationVersion ?: "unspecified"
 private val GUEST_RUNTIME_COORDINATE: String
     get() = "dev.brahmkshatriya.wasmtime:guest-runtime:$SDK_VERSION"
+private const val SERIALIZATION_CBOR_COORDINATE: String =
+    "org.jetbrains.kotlinx:kotlinx-serialization-cbor:1.11.0"
 private val WASMTIME_ARTIFACT_ATTRIBUTE: Attribute<String> =
     Attribute.of("dev.brahmkshatriya.wasmtime.artifact", String::class.java)
 
@@ -151,13 +153,13 @@ public open class WasmtimeExtensionSettings internal constructor(
     /** Host/guest extension ABI version. */
     public val apiVersion: Property<Int> = objects.property(Int::class.java)
 
-    /** Declared extension capabilities such as `Http`, `PersistentStorage`, or `Streaming`. */
+    /** Declared extension capabilities such as `Http`, `PersistentStorage`, `Streaming`, or `HostResources`. */
     public val capabilities: org.gradle.api.provider.ListProperty<String> = objects.listProperty(String::class.java)
 
     /** Fully-qualified guest object/class that implements [contractInterface]. */
     public val implementationClass: Property<String> = objects.property(String::class.java)
 
-    /** Fully-qualified suspend contract interface implemented by the guest and proxied on the host. */
+    /** Fully-qualified contract interface implemented by the guest and proxied on the host. */
     public val contractInterface: Property<String> = objects.property(String::class.java)
 
     /** Additional generated Kotlin source directories included in `wasmWasiMain`. */
@@ -325,9 +327,10 @@ class WasmtimeExtensionPlugin : Plugin<Project> {
         settings.extensionId.convention(project.name)
         settings.displayName.convention(project.name)
         settings.extensionVersion.convention(providers.provider { project.version.toString() })
-        settings.apiVersion.convention(1)
+        settings.apiVersion.convention(2)
         settings.capabilities.convention(emptyList())
         dependencies.add(compileOnly.name, guestRuntimeDependency())
+        dependencies.add(compileOnly.name, SERIALIZATION_CBOR_COORDINATE)
 
         val generatedAdapter = tasks.register<GenerateWasmtimeExtensionAdapterTask>(
             "generateWasmtimeExtensionAdapter"
@@ -466,6 +469,7 @@ class WasmtimeHostPlugin : Plugin<Project> {
             outputDirectory.convention(layout.buildDirectory.dir("generated/wasmtimeHost/kotlin"))
         }
         pluginManager.withPlugin("org.jetbrains.kotlin.multiplatform") {
+            dependencies.add("commonMainImplementation", SERIALIZATION_CBOR_COORDINATE)
             extensions.getByType<KotlinMultiplatformExtension>()
                 .sourceSets.named("commonMain") {
                     kotlin.srcDir(generatedProxy.flatMap { it.outputDirectory })

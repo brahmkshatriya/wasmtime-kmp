@@ -15,7 +15,7 @@ wasmtime {
 }
 
 wasmtimeHost {
-    contractInterface.set("dev.brahmkshatriya.wasmtime.demo.shared.Plugin")
+    contractInterface.set("dev.brahmkshatriya.wasmtime.demo.shared.MusicExtensionClient")
     bundleExtension(projects.demo.plugin1)
     bundleExtension(projects.demo.plugin2)
     runtimeDependencies {

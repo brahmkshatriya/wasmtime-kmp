@@ -563,6 +563,9 @@ kotlin {
             }
         }
         val commonTest = getByName("commonTest")
+        commonTest.dependencies {
+            implementation(kotlin("test"))
+        }
         val nativeHostTest = maybeCreate("nativeHostTest").apply {
             dependsOn(commonTest)
         }
@@ -586,6 +589,13 @@ kotlin {
         getByName("jvmMain") {
             dependsOn(jniMain)
         }
+    }
+}
+
+tasks.matching { it.name == "jvmTest" }.configureEach {
+    dependsOn(jvmLinuxX64NativeJar)
+    if (this is Test) {
+        classpath = classpath.plus(files(jvmLinuxX64NativeJar.flatMap { it.archiveFile }))
     }
 }
 

@@ -22,6 +22,7 @@ compose-native-desktop = { module = "dev.brahmkshatriya.compose.desktop:desktop-
 androidx-activity-compose = { module = "androidx.activity:activity-compose", version = "1.13.0" }
 kotlin-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinCoroutines" }
 kotlin-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinSerialization" }
+kotlin-serialization-cbor = { module = "org.jetbrains.kotlinx:kotlinx-serialization-cbor", version.ref = "kotlinSerialization" }
 
 [bundles]
 compose-android = ["compose-android-runtime", "compose-android-ui", "compose-android-foundation", "compose-android-material3", "compose-android-components-resources"]

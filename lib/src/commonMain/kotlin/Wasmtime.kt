@@ -311,6 +311,7 @@ public object Wasmtime {
         httpHandler: WasmtimeHttpHandler? = null,
         storage: WasmtimeStorage? = null,
         runtime: WasmtimeRuntime? = null,
+        imports: WasmtimeImports = WasmtimeImports.Empty,
     ): WasmtimeInstance {
         require(wasm.isNotEmpty()) { "wasm must not be empty" }
         require(limits.maxModuleBytes == 0 || wasm.size <= limits.maxModuleBytes) {
@@ -318,7 +319,7 @@ public object Wasmtime {
         }
         validateRuntimeModuleSizes(limits, runtime)
         return WasmtimeInstance(
-            createPlatformWasmtimeInstance(wasm, limits, httpHandler, storage, runtime),
+            createPlatformWasmtimeInstance(wasm, limits, httpHandler, storage, runtime, imports),
         )
     }
 }
@@ -347,11 +348,12 @@ public class WasmtimeModule internal constructor(
         httpHandler: WasmtimeHttpHandler? = null,
         storage: WasmtimeStorage? = null,
         runtime: WasmtimeRuntime? = null,
+        imports: WasmtimeImports = WasmtimeImports.Empty,
     ): WasmtimeInstance {
         validateRuntimeModuleSizes(limits, runtime)
         beginUse()
         try {
-            return WasmtimeInstance(platform.instantiate(limits, httpHandler, storage, runtime))
+            return WasmtimeInstance(platform.instantiate(limits, httpHandler, storage, runtime, imports))
         } finally {
             endUse()
         }
@@ -403,6 +405,8 @@ public class WasmtimeInstance internal constructor(
     private val closing = AtomicInt(0)
     private val platformClosed = AtomicInt(0)
     private val i32Functions = mutableMapOf<String, WasmtimeI32Function>()
+    private val functions = mutableMapOf<Pair<String, WasmtimeFunctionType>, WasmtimeFunction>()
+    private val memories = mutableMapOf<String, WasmtimeMemory>()
 
     /**
      * Resolves and caches an exported function with signature `(i32, i32) -> i32`.
@@ -439,12 +443,61 @@ public class WasmtimeInstance internal constructor(
     public suspend fun callI32Async(exportName: String, first: Int, second: Int): Int =
         functionI32(exportName).invokeAsync(first, second)
 
+    /** Resolves and caches an exported scalar function with the exact [type] supplied by the caller. */
+    public fun function(exportName: String, type: WasmtimeFunctionType): WasmtimeFunction {
+        beginUse()
+        try {
+            return withLifecycleLock {
+                check(closing.load() == 0) { "Wasmtime instance is closed" }
+                functions.getOrPut(exportName to type) {
+                    WasmtimeFunction(
+                        type = type,
+                        platform = platform.resolveFunction(exportName, type),
+                        ownerBeginUse = ::beginUse,
+                        ownerEndUse = ::endUse,
+                    )
+                }
+            }
+        } finally {
+            endUse()
+        }
+    }
+
+    /** Calls an exported scalar function once. */
+    public fun call(
+        exportName: String,
+        type: WasmtimeFunctionType,
+        arguments: List<WasmValue> = emptyList(),
+    ): List<WasmValue> = function(exportName, type).call(arguments)
+
+    /** Resolves an exported linear memory, usually named `memory`. */
+    public fun memory(exportName: String = "memory"): WasmtimeMemory {
+        beginUse()
+        try {
+            return withLifecycleLock {
+                check(closing.load() == 0) { "Wasmtime instance is closed" }
+                memories.getOrPut(exportName) {
+                    WasmtimeMemory(
+                        platform = platform.resolveMemory(exportName),
+                        ownerBeginUse = ::beginUse,
+                        ownerEndUse = ::endUse,
+                    )
+                }
+            }
+        } finally {
+            endUse()
+        }
+    }
+
     /** Releases the instance after in-flight calls finish. Safe to call more than once. */
     public fun close() {
         withLifecycleLock {
             if (!closing.compareAndSet(0, 1)) return@withLifecycleLock
             i32Functions.values.forEach { it.closeInternal() }
             i32Functions.clear()
+            functions.values.forEach { it.closeInternal() }
+            functions.clear()
+            memories.clear()
         }
         if (activeUses.load() == 0) closePlatformOnce()
     }
@@ -557,6 +610,8 @@ public class WasmtimeI32Function internal constructor(
 
 internal interface PlatformWasmtimeInstance {
     fun resolveI32(exportName: String): PlatformWasmtimeI32Function
+    fun resolveFunction(exportName: String, type: WasmtimeFunctionType): PlatformWasmtimeFunction
+    fun resolveMemory(exportName: String): PlatformWasmtimeMemory
     fun close()
 }
 
@@ -572,6 +627,7 @@ internal interface PlatformWasmtimeModule {
         httpHandler: WasmtimeHttpHandler?,
         storage: WasmtimeStorage?,
         runtime: WasmtimeRuntime?,
+        imports: WasmtimeImports,
     ): PlatformWasmtimeInstance
     fun close()
 }
@@ -586,4 +642,5 @@ internal expect fun createPlatformWasmtimeInstance(
     httpHandler: WasmtimeHttpHandler?,
     storage: WasmtimeStorage?,
     runtime: WasmtimeRuntime?,
+    imports: WasmtimeImports,
 ): PlatformWasmtimeInstance

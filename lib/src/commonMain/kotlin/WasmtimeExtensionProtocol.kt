@@ -6,7 +6,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
-import kotlinx.coroutines.sync.withLock
+import kotlin.concurrent.atomics.AtomicInt
+import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.time.TimeSource
 
 /**
@@ -19,8 +20,20 @@ import kotlin.time.TimeSource
  * [invoke] is suspend because a guest contract method may suspend on guest timers or asynchronous host calls.
  */
 public interface WasmtimeExtensionTransport {
+    /** Whether repeated calls address the same live guest instance and may therefore use resource handles. */
+    public val supportsPersistentResources: Boolean get() = false
+
     /** Invokes one generated contract method with its serialized argument payload. */
     public suspend fun invoke(methodId: Int, arguments: ByteArray = ByteArray(0)): ByteArray
+
+    /**
+     * Invokes a contract member that is declared non-suspending.
+     *
+     * The guest implementation must complete without suspending. Transports that cannot provide a
+     * synchronous execution path (for example an isolated browser worker) may reject this operation.
+     */
+    public fun invokeSync(methodId: Int, arguments: ByteArray = ByteArray(0)): ByteArray =
+        error("Synchronous extension invocation is not supported by this transport")
 
     /** Releases any reusable Wasm instance owned by this transport. */
     public fun close() {}
@@ -57,6 +70,7 @@ public class WasmtimeExtensionException(
  * @param maxResultBytes maximum serialized contract result/error size, or `0` to accept only empty results.
  * @throws IllegalArgumentException when input modules or [maxResultBytes] violate the configured limits.
  */
+@OptIn(ExperimentalAtomicApi::class)
 public fun createWasmtimeExtensionTransport(
     wasm: ByteArray,
     limits: WasmtimeLimits = WasmtimeLimits(),
@@ -90,10 +104,13 @@ public fun createWasmtimeExtensionTransport(
         storage = services.effectiveStorage(),
         runtime = runtime,
     )
-    val lock = kotlinx.coroutines.sync.Mutex()
+    val callGate = AtomicInt(0)
     return object : WasmtimeExtensionTransport {
-        override suspend fun invoke(methodId: Int, arguments: ByteArray): ByteArray =
-            lock.withLock {
+        override val supportsPersistentResources: Boolean = true
+
+        override suspend fun invoke(methodId: Int, arguments: ByteArray): ByteArray {
+            while (!callGate.compareAndSet(0, 1)) yield()
+            try {
                 services.logger?.log(
                     WasmtimeExtensionLogEvent(
                         manifest?.id,
@@ -101,7 +118,7 @@ public fun createWasmtimeExtensionTransport(
                         "Calling extension method $methodId (${arguments.size} argument bytes)",
                     )
                 )
-                try {
+                return try {
                     withContext(Dispatchers.Default) {
                         if (limits.maxExecutionMillis > 0) {
                             withTimeout(limits.maxExecutionMillis) {
@@ -130,7 +147,28 @@ public fun createWasmtimeExtensionTransport(
                     )
                     throw failure
                 }
+            } finally {
+                callGate.store(0)
             }
+        }
+
+        override fun invokeSync(methodId: Int, arguments: ByteArray): ByteArray {
+            check(callGate.compareAndSet(0, 1)) {
+                "extension transport is busy; a synchronous call cannot wait for another invocation"
+            }
+            try {
+                services.logger?.log(
+                    WasmtimeExtensionLogEvent(
+                        manifest?.id,
+                        WasmtimeExtensionLogEvent.Level.Debug,
+                        "Calling synchronous extension method $methodId (${arguments.size} argument bytes)",
+                    )
+                )
+                return instance.callExtensionSync(methodId, arguments, maxArgumentBytes, maxResultBytes)
+            } finally {
+                callGate.store(0)
+            }
+        }
 
         override fun close() {
             instance.close()
@@ -231,6 +269,67 @@ public suspend fun WasmtimeInstance.callExtension(
         }
     } finally {
         if (state == ExtensionProtocol.PENDING) cancel(0, 0)
+    }
+}
+
+/**
+ * Invokes a generated non-suspending extension method through the fixed extension ABI.
+ *
+ * If the guest method suspends for any reason, the call is cancelled and rejected. This keeps a Kotlin
+ * non-suspending contract member non-blocking and prevents hidden coroutine/event-loop pumping.
+ */
+public fun WasmtimeInstance.callExtensionSync(
+    methodId: Int,
+    arguments: ByteArray = ByteArray(0),
+    maxArgumentBytes: Int = WasmtimeLimits().maxHostCallBytes,
+    maxResultBytes: Int = 16 * 1024 * 1024,
+): ByteArray {
+    require(maxArgumentBytes >= 0) { "maxArgumentBytes must be >= 0" }
+    require(maxArgumentBytes == 0 || arguments.size <= maxArgumentBytes) {
+        "extension argument payload is too large: ${arguments.size} > $maxArgumentBytes bytes"
+    }
+    require(maxResultBytes >= 0) { "maxResultBytes must be >= 0" }
+
+    val prepareArguments = functionI32(ExtensionProtocol.ARGUMENT_PREPARE)
+    val setArgumentByte = functionI32(ExtensionProtocol.ARGUMENT_BYTE)
+    val start = functionI32(ExtensionProtocol.START)
+    val cancel = functionI32(ExtensionProtocol.CANCEL)
+    val resultLength = functionI32(ExtensionProtocol.RESULT_LENGTH)
+    val resultByte = functionI32(ExtensionProtocol.RESULT_BYTE)
+    val errorLength = functionI32(ExtensionProtocol.ERROR_LENGTH)
+    val errorByte = functionI32(ExtensionProtocol.ERROR_BYTE)
+
+    check(prepareArguments(arguments.size, 0) == 0) { "extension rejected argument payload" }
+    arguments.forEachIndexed { index, byte ->
+        check(setArgumentByte(index, byte.toInt() and 0xff) == 0) {
+            "extension rejected argument byte $index"
+        }
+    }
+
+    val state = start(methodId, 0)
+    if (state == ExtensionProtocol.PENDING) {
+        cancel(0, 0)
+        error("non-suspending extension method $methodId attempted to suspend")
+    }
+    return when (state) {
+        ExtensionProtocol.SUCCESS -> {
+            val length = resultLength(0, 0)
+            require(length in 0..maxResultBytes) { "invalid extension result length: $length" }
+            ByteArray(length) { index -> resultByte(index, 0).toByte() }
+        }
+
+        ExtensionProtocol.FAILURE -> {
+            val bytes = readExtensionBytes(errorLength, errorByte, maxResultBytes)
+            throw decodeExtensionFailure(bytes)
+        }
+
+        ExtensionProtocol.CANCELLED -> {
+            val bytes = readExtensionBytes(errorLength, errorByte, maxResultBytes)
+            val failure = decodeExtensionFailure(bytes)
+            throw CancellationException("extension call cancelled: ${failure.message}")
+        }
+
+        else -> error("invalid extension call state: $state")
     }
 }
 
