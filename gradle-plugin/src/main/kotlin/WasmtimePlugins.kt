@@ -285,7 +285,7 @@ private fun Project.registerTypePruner(): TypePrunerRegistration {
         root.tasks.register<BuildWasmTypePrunerTask>(taskName) {
             group = "wasmtime"
             description = "Builds the shared GC type-pruning helper used for Wasmtime Wasm artifacts."
-            rustVersion.convention(root.providers.environmentVariable("WASMTIME_RUST_VERSION").orElse("1.96.0"))
+            rustVersion.convention(root.providers.environmentVariable("WASMTIME_RUST_VERSION").orElse("1.97.0"))
             outputExecutable.convention(output)
         }
     }

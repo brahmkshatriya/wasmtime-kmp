@@ -7,32 +7,48 @@ upper_ascii() {
 
 NATIVE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$NATIVE_DIR/../../.." && pwd)"
-VERSION="${WASMTIME_VERSION:-49.0.1}"
+VERSION="${WASMTIME_VERSION:-50.0.1}"
 DEPS="$NATIVE_DIR/.deps"
 
-download_wasmtime() {
+download_wasmtime() (
+    set -e
     local triplet="$1"
-    local target="$DEPS/$triplet"
+    local target="$DEPS/wasmtime-v${VERSION}-${triplet}-c-api"
     local archive="$DEPS/wasmtime-v${VERSION}-${triplet}-c-api.tar.xz"
     local url="https://github.com/bytecodealliance/wasmtime/releases/download/v${VERSION}/wasmtime-v${VERSION}-${triplet}-c-api.tar.xz"
 
     if [[ ! -f "$target/include/wasmtime.h" || ! -f "$target/lib/libwasmtime.a" ]]; then
         mkdir -p "$DEPS"
+        local staging
+        staging="$(mktemp -d "$DEPS/.wasmtime-c-api.XXXXXXXX")"
+        trap 'rm -rf "$staging"' EXIT
         if [[ ! -f "$archive" ]]; then
-            curl -fL --retry 3 --retry-delay 1 -o "$archive" "$url"
+            curl -fL --retry 3 --retry-delay 1 -o "$staging/${archive##*/}" "$url"
+            mv -n "$staging/${archive##*/}" "$DEPS/"
         fi
-        rm -rf "$target"
-        mkdir -p "$target"
-        tar -xJf "$archive" -C "$target" --strip-components=1
+        mkdir "$staging/${target##*/}"
+        tar -xJf "$archive" -C "$staging/${target##*/}" --strip-components=1
+        mv -n "$staging/${target##*/}" "$DEPS/"
+    fi
+    if [[ ! -f "$target/include/wasmtime.h" || ! -f "$target/lib/libwasmtime.a" ]]; then
+        echo "Incomplete Wasmtime $VERSION C API for $triplet: $target" >&2
+        exit 1
     fi
     printf '%s\n' "$target"
+)
+
+current_slim_archive() {
+    local directory="$DEPS/slim/$1/lib"
+    [[ -f "$directory/libwasmtime.a" && -f "$directory/build.stamp" ]] &&
+        [[ "$(cat "$directory/build.stamp")" == "wasmtime=${VERSION};"* ]] || return 1
+    printf '%s\n' "$directory/libwasmtime.a"
 }
 
 select_wasmtime_archive() {
     local triplet="$1"
     local dep="$2"
-    local slim="$DEPS/slim/$triplet/lib/libwasmtime.a"
-    if [[ "${WASMTIME_USE_FULL:-0}" != "1" && -f "$slim" ]]; then
+    local slim
+    if [[ "${WASMTIME_USE_FULL:-0}" != "1" ]] && slim="$(current_slim_archive "$triplet")"; then
         echo "Using slim Wasmtime archive: $slim" >&2
         printf '%s\n' "$slim"
     else
@@ -151,8 +167,11 @@ build_linux_arm64() {
 build_windows_x64() {
     local headers
     headers="$(download_wasmtime x86_64-linux)"
-    local archive="$DEPS/slim/x86_64-windows-gnu/lib/libwasmtime.a"
-    [[ -f "$archive" ]] || { echo "Windows compact Wasmtime archive is missing; run build-slim-wasmtime.sh windows-x64" >&2; exit 1; }
+    local archive
+    archive="$(current_slim_archive x86_64-windows-gnu)" || {
+        echo "Windows compact Wasmtime $VERSION archive is missing; run build-slim-wasmtime.sh windows-x64" >&2
+        exit 1
+    }
     local out="$ROOT/lib/build/native/mingwX64"
     mkdir -p "$out"
 
@@ -192,11 +211,15 @@ build_apple() {
     [[ "$archive_triplet" == "aarch64-ios" ]] && headers_triplet="aarch64-macos"
     local dep
     dep="$(download_wasmtime "$headers_triplet")"
-    local archive="$DEPS/slim/$archive_triplet/lib/libwasmtime.a"
+    local archive
     if [[ "${WASMTIME_USE_FULL:-0}" == "1" && "$archive_triplet" != "aarch64-ios" ]]; then
         archive="$dep/lib/libwasmtime.a"
+    else
+        archive="$(current_slim_archive "$archive_triplet")" || {
+            echo "Wasmtime $VERSION archive missing for $archive_triplet" >&2
+            exit 1
+        }
     fi
-    [[ -f "$archive" ]] || { echo "Wasmtime archive missing for $archive_triplet" >&2; exit 1; }
     local out="$ROOT/lib/build/native/$konan_dir"
     mkdir -p "$out"
     local sdk_path="$(xcrun --sdk "$sdk" --show-sdk-path)"

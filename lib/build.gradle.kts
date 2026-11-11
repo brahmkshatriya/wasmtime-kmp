@@ -26,6 +26,8 @@ val slimWasmtimeMacosArm64 = project.file("src/native/.deps/slim/aarch64-macos/l
 val slimWasmtimeIosArm64 = project.file("src/native/.deps/slim/aarch64-ios/lib/libwasmtime.a")
 val slimWasmtimeAndroidArm64 = project.file("src/native/.deps/slim/aarch64-android/lib/libwasmtime.a")
 val slimWasmtimeAndroidX64 = project.file("src/native/.deps/slim/x86_64-android/lib/libwasmtime.a")
+val wasmtimeVersion = providers.environmentVariable("WASMTIME_VERSION").orElse("50.0.1")
+val wasmtimeRustVersion = providers.environmentVariable("WASMTIME_RUST_VERSION").orElse("1.97.0")
 val useFullWasmtime = providers.environmentVariable("WASMTIME_USE_FULL").orElse("0")
 val wasmtimeBash = providers.environmentVariable("WASMTIME_BASH").orElse("bash")
 val wasmtimeCompilerOptLevel = providers.environmentVariable("WASMTIME_COMPILER_OPT_LEVEL").orElse("s")
@@ -37,80 +39,80 @@ val buildSlimWasmtimeLinux = tasks.register<Exec>("buildSlimWasmtimeLinux") {
     workingDir(rootProject.projectDir)
     commandLine(wasmtimeBash.get(), project.file("src/native/build-slim-wasmtime.sh"), "linux-x64")
     inputs.file(project.file("src/native/build-slim-wasmtime.sh"))
-    inputs.property("wasmtimeVersion", providers.environmentVariable("WASMTIME_VERSION").orElse("49.0.1"))
-    inputs.property("rustVersion", providers.environmentVariable("WASMTIME_RUST_VERSION").orElse("1.96.0"))
+    inputs.property("wasmtimeVersion", wasmtimeVersion)
+    inputs.property("rustVersion", wasmtimeRustVersion)
     inputs.property("compilerOptLevel", wasmtimeCompilerOptLevel)
-    outputs.file(slimWasmtimeLinux)
+    outputs.files(slimWasmtimeLinux, slimWasmtimeLinux.resolveSibling("build.stamp"))
 }
 
 val buildSlimWasmtimeLinuxArm64 = tasks.register<Exec>("buildSlimWasmtimeLinuxArm64") {
     workingDir(rootProject.projectDir)
     commandLine(wasmtimeBash.get(), project.file("src/native/build-slim-wasmtime.sh"), "linux-arm64")
     inputs.file(project.file("src/native/build-slim-wasmtime.sh"))
-    inputs.property("wasmtimeVersion", providers.environmentVariable("WASMTIME_VERSION").orElse("49.0.1"))
-    inputs.property("rustVersion", providers.environmentVariable("WASMTIME_RUST_VERSION").orElse("1.96.0"))
+    inputs.property("wasmtimeVersion", wasmtimeVersion)
+    inputs.property("rustVersion", wasmtimeRustVersion)
     inputs.property("compilerOptLevel", wasmtimeCompilerOptLevel)
-    outputs.file(slimWasmtimeLinuxArm64)
+    outputs.files(slimWasmtimeLinuxArm64, slimWasmtimeLinuxArm64.resolveSibling("build.stamp"))
 }
 
 val buildSlimWasmtimeWindows = tasks.register<Exec>("buildSlimWasmtimeWindows") {
     workingDir(rootProject.projectDir)
     commandLine(wasmtimeBash.get(), project.file("src/native/build-slim-wasmtime.sh"), "windows-x64")
     inputs.file(project.file("src/native/build-slim-wasmtime.sh"))
-    inputs.property("wasmtimeVersion", providers.environmentVariable("WASMTIME_VERSION").orElse("49.0.1"))
-    inputs.property("rustVersion", providers.environmentVariable("WASMTIME_RUST_VERSION").orElse("1.96.0"))
+    inputs.property("wasmtimeVersion", wasmtimeVersion)
+    inputs.property("rustVersion", wasmtimeRustVersion)
     inputs.property("compilerOptLevel", wasmtimeCompilerOptLevel)
-    outputs.file(slimWasmtimeWindowsX64)
+    outputs.files(slimWasmtimeWindowsX64, slimWasmtimeWindowsX64.resolveSibling("build.stamp"))
 }
 
 val buildSlimWasmtimeMacosX64 = tasks.register<Exec>("buildSlimWasmtimeMacosX64") {
     workingDir(rootProject.projectDir)
     commandLine(wasmtimeBash.get(), project.file("src/native/build-slim-wasmtime.sh"), "macos-x64")
     inputs.file(project.file("src/native/build-slim-wasmtime.sh"))
-    inputs.property("wasmtimeVersion", providers.environmentVariable("WASMTIME_VERSION").orElse("49.0.1"))
-    inputs.property("rustVersion", providers.environmentVariable("WASMTIME_RUST_VERSION").orElse("1.96.0"))
+    inputs.property("wasmtimeVersion", wasmtimeVersion)
+    inputs.property("rustVersion", wasmtimeRustVersion)
     inputs.property("compilerOptLevel", wasmtimeCompilerOptLevel)
-    outputs.file(slimWasmtimeMacosX64)
+    outputs.files(slimWasmtimeMacosX64, slimWasmtimeMacosX64.resolveSibling("build.stamp"))
 }
 
 val buildSlimWasmtimeMacosArm64 = tasks.register<Exec>("buildSlimWasmtimeMacosArm64") {
     workingDir(rootProject.projectDir)
     commandLine(wasmtimeBash.get(), project.file("src/native/build-slim-wasmtime.sh"), "macos-arm64")
     inputs.file(project.file("src/native/build-slim-wasmtime.sh"))
-    inputs.property("wasmtimeVersion", providers.environmentVariable("WASMTIME_VERSION").orElse("49.0.1"))
-    inputs.property("rustVersion", providers.environmentVariable("WASMTIME_RUST_VERSION").orElse("1.96.0"))
+    inputs.property("wasmtimeVersion", wasmtimeVersion)
+    inputs.property("rustVersion", wasmtimeRustVersion)
     inputs.property("compilerOptLevel", wasmtimeCompilerOptLevel)
-    outputs.file(slimWasmtimeMacosArm64)
+    outputs.files(slimWasmtimeMacosArm64, slimWasmtimeMacosArm64.resolveSibling("build.stamp"))
 }
 
 val buildSlimWasmtimeIosArm64 = tasks.register<Exec>("buildSlimWasmtimeIosArm64") {
     workingDir(rootProject.projectDir)
     commandLine(wasmtimeBash.get(), project.file("src/native/build-slim-wasmtime.sh"), "ios-arm64")
     inputs.file(project.file("src/native/build-slim-wasmtime.sh"))
-    inputs.property("wasmtimeVersion", providers.environmentVariable("WASMTIME_VERSION").orElse("49.0.1"))
-    inputs.property("rustVersion", providers.environmentVariable("WASMTIME_RUST_VERSION").orElse("1.96.0"))
+    inputs.property("wasmtimeVersion", wasmtimeVersion)
+    inputs.property("rustVersion", wasmtimeRustVersion)
     inputs.property("compilerOptLevel", wasmtimeCompilerOptLevel)
-    outputs.file(slimWasmtimeIosArm64)
+    outputs.files(slimWasmtimeIosArm64, slimWasmtimeIosArm64.resolveSibling("build.stamp"))
 }
 
 val buildSlimWasmtimeAndroidArm64 = tasks.register<Exec>("buildSlimWasmtimeAndroidArm64") {
     workingDir(rootProject.projectDir)
     commandLine(wasmtimeBash.get(), project.file("src/native/build-slim-wasmtime.sh"), "android-arm64")
     inputs.file(project.file("src/native/build-slim-wasmtime.sh"))
-    inputs.property("wasmtimeVersion", providers.environmentVariable("WASMTIME_VERSION").orElse("49.0.1"))
-    inputs.property("rustVersion", providers.environmentVariable("WASMTIME_RUST_VERSION").orElse("1.96.0"))
+    inputs.property("wasmtimeVersion", wasmtimeVersion)
+    inputs.property("rustVersion", wasmtimeRustVersion)
     inputs.property("compilerOptLevel", wasmtimeCompilerOptLevel)
-    outputs.file(slimWasmtimeAndroidArm64)
+    outputs.files(slimWasmtimeAndroidArm64, slimWasmtimeAndroidArm64.resolveSibling("build.stamp"))
 }
 
 val buildSlimWasmtimeAndroidX64 = tasks.register<Exec>("buildSlimWasmtimeAndroidX64") {
     workingDir(rootProject.projectDir)
     commandLine(wasmtimeBash.get(), project.file("src/native/build-slim-wasmtime.sh"), "android-x86_64")
     inputs.file(project.file("src/native/build-slim-wasmtime.sh"))
-    inputs.property("wasmtimeVersion", providers.environmentVariable("WASMTIME_VERSION").orElse("49.0.1"))
-    inputs.property("rustVersion", providers.environmentVariable("WASMTIME_RUST_VERSION").orElse("1.96.0"))
+    inputs.property("wasmtimeVersion", wasmtimeVersion)
+    inputs.property("rustVersion", wasmtimeRustVersion)
     inputs.property("compilerOptLevel", wasmtimeCompilerOptLevel)
-    outputs.file(slimWasmtimeAndroidX64)
+    outputs.files(slimWasmtimeAndroidX64, slimWasmtimeAndroidX64.resolveSibling("build.stamp"))
 }
 
 val buildSlimWasmtimeAndroid = tasks.register("buildSlimWasmtimeAndroid") {
@@ -129,8 +131,9 @@ tasks.register("buildSlimWasmtime") {
 }
 
 fun org.gradle.api.Task.trackOptionalSlimArchive(file: File) {
-    inputs.files(providers.provider { if (file.isFile) listOf(file) else emptyList() })
-    inputs.property("wasmtimeUseFull", providers.environmentVariable("WASMTIME_USE_FULL").orElse("0"))
+    inputs.files(providers.provider { listOf(file, file.resolveSibling("build.stamp")).filter(File::isFile) })
+    inputs.property("wasmtimeUseFull", useFullWasmtime)
+    inputs.property("wasmtimeVersion", wasmtimeVersion)
 }
 
 tasks.register<Exec>("buildLinuxNativeBridge") {

@@ -54,8 +54,8 @@ permissions:
   contents: read
 
 env:
-  WASMTIME_VERSION: "49.0.1"
-  WASMTIME_RUST_VERSION: "1.96.0"
+  WASMTIME_VERSION: "50.0.1"
+  WASMTIME_RUST_VERSION: "1.97.0"
 
 jobs:
   prepare:
@@ -155,7 +155,7 @@ jobs:
             lib/src/native/.deps/rustup
             lib/src/native/.deps/slim/aarch64-android
             lib/src/native/.deps/slim-target/aarch64-android
-          key: wasmtime-android-arm64-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
+          key: wasmtime-android-arm64-${{ env.WASMTIME_VERSION }}-rust-${{ env.WASMTIME_RUST_VERSION }}-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
       - name: Build Android ARM64 payload
         shell: bash
         env:
@@ -190,7 +190,7 @@ jobs:
             lib/src/native/.deps/rustup
             lib/src/native/.deps/slim/x86_64-android
             lib/src/native/.deps/slim-target/x86_64-android
-          key: wasmtime-android-x64-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
+          key: wasmtime-android-x64-${{ env.WASMTIME_VERSION }}-rust-${{ env.WASMTIME_RUST_VERSION }}-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
       - name: Build Android x86_64 payload
         shell: bash
         env:
@@ -282,7 +282,7 @@ jobs:
             lib/src/native/.deps/rustup
             lib/src/native/.deps/slim/x86_64-linux
             lib/src/native/.deps/slim-target/x86_64-linux
-          key: wasmtime-linux-x64-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
+          key: wasmtime-linux-x64-${{ env.WASMTIME_VERSION }}-rust-${{ env.WASMTIME_RUST_VERSION }}-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
       - name: Publish Linux x64 artifact and JVM classifier
         shell: bash
         env:
@@ -320,7 +320,7 @@ jobs:
             lib/src/native/.deps/rustup
             lib/src/native/.deps/slim/aarch64-linux
             lib/src/native/.deps/slim-target/aarch64-linux
-          key: wasmtime-linux-arm64-native-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
+          key: wasmtime-linux-arm64-native-${{ env.WASMTIME_VERSION }}-rust-${{ env.WASMTIME_RUST_VERSION }}-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
       - name: Build native ARM64 Wasmtime, Kotlin/Native bridge archives and JVM runtime
         shell: bash
         run: |
@@ -408,7 +408,7 @@ jobs:
             lib/src/native/.deps/rustup
             lib/src/native/.deps/slim/x86_64-windows-gnu
             lib/src/native/.deps/slim-target/x86_64-windows-gnu
-          key: wasmtime-windows-x64-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
+          key: wasmtime-windows-x64-${{ env.WASMTIME_VERSION }}-rust-${{ env.WASMTIME_RUST_VERSION }}-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
       - name: Publish Windows x64 artifact natively
         shell: bash
         env:
@@ -452,7 +452,7 @@ jobs:
             lib/src/native/.deps/rustup
             lib/src/native/.deps/slim/x86_64-macos
             lib/src/native/.deps/slim-target/x86_64-macos
-          key: wasmtime-macos-x64-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
+          key: wasmtime-macos-x64-${{ env.WASMTIME_VERSION }}-rust-${{ env.WASMTIME_RUST_VERSION }}-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
       - name: Publish macOS x64 artifact
         shell: bash
         env:
@@ -493,7 +493,7 @@ jobs:
             lib/src/native/.deps/rustup
             lib/src/native/.deps/slim/aarch64-macos
             lib/src/native/.deps/slim-target/aarch64-macos
-          key: wasmtime-macos-arm64-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
+          key: wasmtime-macos-arm64-${{ env.WASMTIME_VERSION }}-rust-${{ env.WASMTIME_RUST_VERSION }}-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
       - name: Publish macOS ARM64 artifact
         shell: bash
         env:
@@ -534,7 +534,7 @@ jobs:
             lib/src/native/.deps/rustup
             lib/src/native/.deps/slim/aarch64-ios
             lib/src/native/.deps/slim-target/aarch64-ios
-          key: wasmtime-ios-arm64-49.0.1-rust-1.96.0-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
+          key: wasmtime-ios-arm64-${{ env.WASMTIME_VERSION }}-rust-${{ env.WASMTIME_RUST_VERSION }}-${{ hashFiles('lib/src/native/build-slim-wasmtime.sh') }}
       - name: Publish iOS ARM64 artifact
         shell: bash
         env:
